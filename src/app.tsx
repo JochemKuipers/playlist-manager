@@ -1,4 +1,3 @@
-// Helper function to check if the selected item is a playlist
 function shouldAddToPlaylist(uris: string[]) {
   if (!uris || uris.length === 0) return false;
 
@@ -6,7 +5,6 @@ function shouldAddToPlaylist(uris: string[]) {
   return Spicetify.URI.isPlaylistV1OrV2(uri);
 }
 
-// Function to get playlist URI from context
 function getPlaylistUri(uris: string[]): string | null {
   if (!uris || uris.length === 0) return null;
   return uris[0];
@@ -17,51 +15,97 @@ function getPlaylistIdFromUri(uri: string): string | null {
   return match ? match[1] : null;
 }
 
-// Helper function to get playlist data using GraphQL
-async function getPlaylistData(playlistUri: string) {
-  console.log("[DEBUG] Fetching playlist data for:", playlistUri);
+function normalizeTrackName(name: string): string {
+  let normalized = name.toLowerCase().trim();
 
-  try {
-    // Try to find a valid GraphQL playlist query
-    const definitions = Spicetify.GraphQL.Definitions;
-    const playlistQuery = definitions.getPlaylist || definitions.queryPlaylistContents || definitions.fetchPlaylistMetadata;
+  // Remove text in parentheses/brackets (e.g., " - 2006 Remaster", "(Remastered)")
+  normalized = normalized.replace(/\s*[\(\[].*?[\)\]]/g, "");
 
-    if (playlistQuery) {
-      console.log("[DEBUG] Using GraphQL playlist query");
+  // Remove common suffixes like " - remaster", " - live", etc.
+  normalized = normalized.replace(/\s*-\s*(remaster(ed)?(\s*\d{2,4})?|live|mono|stereo|single version).*$/i, "");
 
-      const response = await Spicetify.GraphQL.Request(
-        playlistQuery,
-        { uri: playlistUri }
-      );
+  // Collapse multiple spaces
+  normalized = normalized.replace(/\s+/g, " ").trim();
 
-      console.log("[DEBUG] GraphQL response:", response);
-      return response?.data?.playlistV2 || response?.data?.playlist || null;
-    } else {
-      console.log("[DEBUG] No suitable GraphQL query found, using CosmosAsync");
+  return normalized;
+}
+
+// Build a "track key" using normalized name and coarse duration buckets,
+function makeTrackKey(name: string, durationMs: number | undefined): string {
+  const normalizedName = normalizeTrackName(name);
+  const safeDuration = typeof durationMs === "number" && !isNaN(durationMs) ? durationMs : 0;
+
+  // Bucket duration in ~3 second windows to allow small timing differences
+  const durationBucket = Math.round(safeDuration / 3000);
+
+  return `${normalizedName}::${durationBucket}`;
+}
+
+type PlaylistTrackInfo = {
+  uri: string;
+  name: string;
+  durationMs: number;
+};
+
+async function fetchAllPlaylistTracks(playlistId: string): Promise<PlaylistTrackInfo[]> {
+  const result: PlaylistTrackInfo[] = [];
+  let offset = 0;
+  const limit = 100;
+
+  while (true) {
+    const page = await Spicetify.CosmosAsync.get(
+      `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=${limit}&offset=${offset}`
+    );
+
+    const items = page?.items ?? [];
+    if (items.length === 0) break;
+
+    for (const item of items) {
+      const trackObj =
+        item?.track ||
+        item?.playable ||
+        item?.contextTrack ||
+        item;
+
+      const uri =
+        item?.uri ||
+        trackObj?.uri ||
+        item?.trackUri;
+
+      const name = trackObj?.name;
+      const durationMs =
+        trackObj?.duration_ms ??
+        trackObj?.duration?.totalMilliseconds ??
+        0;
+
+      if (uri && name) {
+        result.push({ uri, name, durationMs });
+      }
     }
-  } catch (error) {
-    console.error("[ERROR] GraphQL fetch failed, trying CosmosAsync:", error);
+
+    if (!page.next) break;
+    offset += limit;
   }
 
-  // Fallback to CosmosAsync using Web API
+  return result;
+}
+
+async function getPlaylistData(playlistUri: string) {
+
   const playlistId = getPlaylistIdFromUri(playlistUri);
-  console.log("[DEBUG] Extracted playlist ID:", playlistId);
 
   if (!playlistId) {
-    console.error("[ERROR] Could not extract playlist ID from URI");
     return null;
   }
 
   const result = await Spicetify.CosmosAsync.get(
     `https://api.spotify.com/v1/playlists/${playlistId}`
   );
-  console.log("[DEBUG] CosmosAsync response:", result);
   return result;
 }
 
 // Clean Playlist - Remove duplicates
 async function cleanPlaylist(uris: string[]) {
-  console.log("[DEBUG] cleanPlaylist called with URIs:", uris);
 
   const playlistUri = getPlaylistUri(uris);
   if (!playlistUri) {
@@ -71,10 +115,8 @@ async function cleanPlaylist(uris: string[]) {
   }
 
   try {
-    console.log("[DEBUG] Starting playlist cleaning for:", playlistUri);
     Spicetify.showNotification("Cleaning playlist...");
 
-    // Get playlist data using GraphQL (with CosmosAsync fallback)
     const playlist = await getPlaylistData(playlistUri);
 
     if (!playlist) {
@@ -82,12 +124,6 @@ async function cleanPlaylist(uris: string[]) {
       return;
     }
 
-    console.log("Playlist:", playlist.name || playlist.displayName);
-    console.log("Tracks:", playlist.content?.items || playlist.tracks?.items);
-
-    // TODO: Implement duplicate removal algorithm
-    // Access tracks via: playlist.content.items (GraphQL) or playlist.tracks.items (REST API)
-    // Each track has a .track.uri property you can use to identify duplicates
 
     Spicetify.showNotification("Playlist cleaned successfully!");
   } catch (error) {
@@ -96,20 +132,26 @@ async function cleanPlaylist(uris: string[]) {
   }
 }
 
-// Helper function to parse artist names from playlist title
 function parseArtistsFromTitle(title: string): string[] {
-  // Split by " / " to get individual artist names
   return title.split(" / ").map(name => name.trim()).filter(name => name.length > 0);
 }
 
-// Helper function to search for artist and get their URI
 async function searchArtist(artistName: string): Promise<string | null> {
   try {
+    const searchLimit = 10;
     const result = await Spicetify.CosmosAsync.get(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=${searchLimit}`
     );
 
+
     if (result?.artists?.items?.length > 0) {
+      const normalizedQuery = artistName.trim().toLowerCase();
+      const matchingArtist = result.artists.items.find(
+        (artist: any) => artist.name.trim().toLowerCase() === normalizedQuery
+      );
+      if (matchingArtist) {
+        return matchingArtist.uri;
+      }
       return result.artists.items[0].uri;
     }
   } catch (error) {
@@ -118,153 +160,142 @@ async function searchArtist(artistName: string): Promise<string | null> {
   return null;
 }
 
-// Helper function to get all albums from artist
-async function getArtistAlbums(artistId: string, includeFeatures: boolean = true): Promise<any[]> {
-  console.log("[DEBUG] Fetching albums for artist:", artistId);
+async function getArtistDiscography(artistId: string): Promise<any[]> {
 
-  const includeGroups = includeFeatures
-    ? 'album,single,appears_on'
-    : 'album,single';
+  const artistAlbumQuery = Spicetify.GraphQL.Definitions.queryArtistDiscographyAll;
 
-  let allAlbums: any[] = [];
-  let offset = 0;
-  const limit = 50;
+  if (!artistAlbumQuery) {
+    const includeGroups = 'album,single,appears_on';
+    let discog: any[] = [];
+    let offset = 0;
+    const limit = 50;
 
-  while (true) {
-    const response = await Spicetify.CosmosAsync.get(
-      `https://api.spotify.com/v1/artists/${artistId}/albums?include_groups=${includeGroups}&limit=${limit}&offset=${offset}`
-    );
+    while (true) {
+      const response = await Spicetify.CosmosAsync.get(
+        `https://api.spotify.com/v1/artists/${artistId}/albums?include_groups=${includeGroups}&limit=${limit}&offset=${offset}`
+      );
 
-    for (const album of response.items) {
-      // Format release date for sorting
-      let releaseDate = album.release_date.replace(/-/g, '');
-      while (releaseDate.length < 8) {
-        releaseDate += '0';
-      }
-
-      allAlbums.push({
-        date: releaseDate,
-        id: album.id,
-        type: album.album_type,
-        name: album.name
-      });
-    }
-
-    if (!response.next) break;
-    offset += limit;
-  }
-
-  // Sort by release date (oldest first)
-  allAlbums.sort((a, b) => a.date.localeCompare(b.date));
-  console.log(`[DEBUG] Found ${allAlbums.length} albums for artist`);
-
-  return allAlbums;
-}
-
-// Helper function to get all tracks from albums with deduplication
-async function getTracksFromAlbums(
-  artistId: string,
-  albums: any[],
-  removeDupes: boolean = true,
-  includeFeatures: boolean = true
-): Promise<string[]> {
-  console.log("[DEBUG] Fetching tracks from", albums.length, "albums");
-
-  const trackHistory: Map<string, any> = new Map(); // ISRC -> track info
-  const trackUris: string[] = [];
-
-  // Process albums in batches of 20
-  for (let i = 0; i < albums.length; i += 20) {
-    const batch = albums.slice(i, i + 20);
-    const albumIds = batch.map(a => a.id).join(',');
-
-    const albumsData = await Spicetify.CosmosAsync.get(
-      `https://api.spotify.com/v1/albums?ids=${albumIds}`
-    );
-
-    for (const album of albumsData.albums) {
-      let tracks = album.tracks;
-
-      do {
-        for (const track of tracks.items) {
-          // Skip features if not wanted
-          if (!includeFeatures && track.artists[0].id !== artistId) {
-            continue;
-          }
-
-          // Check if artist is in the track
-          const trackArtistIds = track.artists.map(a => a.id);
-          if (!trackArtistIds.includes(artistId)) {
-            continue;
-          }
-
-          if (removeDupes) {
-            // Get full track data for ISRC
-            const trackData = await Spicetify.CosmosAsync.get(
-              `https://api.spotify.com/v1/tracks/${track.id}`
-            );
-
-            const isrc = trackData.external_ids?.isrc;
-            if (!isrc) {
-              trackUris.push(trackData.uri);
-              continue;
-            }
-
-            const existing = trackHistory.get(isrc);
-
-            if (existing) {
-              // Prefer non-compilation albums with more tracks
-              if (
-                album.album_type !== 'compilation' &&
-                (existing.type === 'compilation' ||
-                  (existing.type !== 'compilation' && tracks.total > existing.trackCount))
-              ) {
-                // Replace the old track
-                const oldIndex = trackUris.indexOf(existing.uri);
-                if (oldIndex >= 0) {
-                  trackUris[oldIndex] = trackData.uri;
-                }
-                trackHistory.set(isrc, {
-                  uri: trackData.uri,
-                  trackCount: tracks.total,
-                  type: album.album_type
-                });
-              }
-            } else {
-              trackHistory.set(isrc, {
-                uri: trackData.uri,
-                trackCount: tracks.total,
-                type: album.album_type
-              });
-              trackUris.push(trackData.uri);
-            }
-          } else {
-            trackUris.push(track.uri);
-          }
+      for (const album of response.items) {
+        let releaseDate = album.release_date.replace(/-/g, '');
+        while (releaseDate.length < 8) {
+          releaseDate += '0';
         }
 
-        if (!tracks.next) break;
-        tracks = await Spicetify.CosmosAsync.get(tracks.next);
-      } while (true);
+        discog.push({
+          id: album.id,
+          name: album.name,
+          date: releaseDate,
+          album_type: album.album_type
+        });
+      }
+
+      if (!response.next) break;
+      offset += limit;
     }
 
-    console.log(`[DEBUG] Processed ${Math.min(i + 20, albums.length)}/${albums.length} albums`);
+    discog.sort((a, b) => a.date.localeCompare(b.date));
+    return discog;
   }
 
-  // Filter out any removed duplicates
-  const finalTracks = trackUris.filter(uri => uri !== null);
-  console.log(`[DEBUG] Total tracks: ${finalTracks.length}`);
+  const discog: any[] = [];
+  let hasNextPage = true;
+  let offset = 0;
+  const seenAlbumIds: Set<string> = new Set();
 
-  return finalTracks;
+  while (hasNextPage) {
+    const variables: any = {
+      uri: `spotify:artist:${artistId}`,
+      offset: offset,
+      limit: 50
+    };
+
+    try {
+      const response = await Spicetify.GraphQL.Request(artistAlbumQuery, variables);
+
+      const items = response?.data?.artistUnion?.discography?.all?.items;
+      if (!items || items.length === 0) break;
+
+      for (const item of items) {
+        const releases = item.releases?.items || [];
+        for (const release of releases) {
+          if (!seenAlbumIds.has(release.id)) {
+            discog.push({
+              id: release.id,
+              name: release.name,
+              date: release.date?.isoString || release.date?.year?.toString() || '',
+              album_type: release.type || 'album'
+            });
+            seenAlbumIds.add(release.id);
+          }
+        }
+      }
+
+      offset += 50;
+      hasNextPage = items.length === 50;
+    } catch (error) {
+      console.error("[ERROR] GraphQL failed, trying REST API:", error);
+    }
+  }
+
+  discog.sort((a, b) => a.date.localeCompare(b.date));
+
+  return discog;
 }
 
-// Main function to get all artist tracks
+type ArtistTrack = {
+  id: string;
+  name: string;
+  uri: string;
+  albumId: string;
+  albumName: string;
+  trackNumber: number;
+  durationMs: number;
+};
+
+async function getTracksFromDiscography(
+  discography: { id: string; name: string }[],
+): Promise<ArtistTrack[]> {
+  const tracks: ArtistTrack[] = [];
+  const seenTrackIds = new Set<string>();
+
+  for (const album of discography) {
+    let offset = 0;
+    const limit = 50;
+
+    while (true) {
+      const res = await Spicetify.CosmosAsync.get(
+        `https://api.spotify.com/v1/albums/${album.id}/tracks?limit=${limit}&offset=${offset}`,
+      );
+
+      const items = res?.items ?? [];
+      if (items.length === 0) break;
+
+      for (const t of items) {
+        if (seenTrackIds.has(t.id)) continue;
+        seenTrackIds.add(t.id);
+
+        tracks.push({
+          id: t.id,
+          name: t.name,
+          uri: t.uri,
+          albumId: album.id,
+          albumName: album.name,
+          trackNumber: t.track_number,
+          durationMs: t.duration_ms,
+        });
+      }
+
+      if (!res.next) break;
+      offset += limit;
+    }
+  }
+
+  return tracks;
+}
+
 async function getArtistTracks(
   artistUri: string,
-  removeDupes: boolean = true,
-  includeFeatures: boolean = true
-): Promise<string[]> {
-  console.log("[DEBUG] Fetching all tracks for:", artistUri);
+): Promise<ArtistTrack[]> {
 
   const artistId = artistUri.split(':').pop();
   if (!artistId) {
@@ -273,11 +304,10 @@ async function getArtistTracks(
   }
 
   try {
-    // Get all albums
-    const albums = await getArtistAlbums(artistId, includeFeatures);
+    const discography = await getArtistDiscography(artistId);
 
-    // Get all tracks from albums
-    const tracks = await getTracksFromAlbums(artistId, albums, removeDupes, includeFeatures);
+
+    const tracks = await getTracksFromDiscography(discography);
 
     return tracks;
   } catch (error) {
@@ -286,9 +316,7 @@ async function getArtistTracks(
   }
 }
 
-// Update Playlist - Add missing songs from artists
 async function updatePlaylist(uris: string[]) {
-  console.log("[DEBUG] updatePlaylist called with URIs:", uris);
 
   const playlistUri = getPlaylistUri(uris);
   if (!playlistUri) {
@@ -298,10 +326,8 @@ async function updatePlaylist(uris: string[]) {
   }
 
   try {
-    console.log("[DEBUG] Starting playlist update for:", playlistUri);
     Spicetify.showNotification("Updating playlist...");
 
-    // Get playlist data using GraphQL (with CosmosAsync fallback)
     const playlist = await getPlaylistData(playlistUri);
 
     if (!playlist) {
@@ -310,25 +336,19 @@ async function updatePlaylist(uris: string[]) {
     }
 
     const playlistName = playlist.name || playlist.displayName;
-    console.log("Playlist name:", playlistName);
 
-    // Parse artist names from playlist title (split by " / ")
     const artistNames = parseArtistsFromTitle(playlistName);
-    console.log("Artists found in title:", artistNames);
 
     if (artistNames.length === 0) {
       Spicetify.showNotification("No artists found in playlist title", true);
       return;
     }
 
-    // Get URIs for all artists
-    console.log("[DEBUG] Searching for artist URIs...");
     const artistUris: string[] = [];
     for (const artistName of artistNames) {
       const artistUri = await searchArtist(artistName);
       if (artistUri) {
         artistUris.push(artistUri);
-        console.log(`[DEBUG] Found artist URI for ${artistName}:`, artistUri);
       } else {
         console.warn(`[WARN] Could not find artist: ${artistName}`);
       }
@@ -339,23 +359,78 @@ async function updatePlaylist(uris: string[]) {
       return;
     }
 
-    // Get all tracks from each artist using GraphQL
-    console.log("[DEBUG] Fetching tracks from", artistUris.length, "artists...");
-    const allArtistTracks: any[] = [];
+    const allArtistTracks: ArtistTrack[] = [];
     for (const artistUri of artistUris) {
       const tracks = await getArtistTracks(artistUri);
       allArtistTracks.push(...tracks);
-      console.log(`[DEBUG] Got ${tracks.length} tracks from ${artistUri}`);
     }
 
-    console.log("[DEBUG] Total artist tracks found:", allArtistTracks.length);
 
-    // TODO: 
-    // 1. Get existing track URIs from playlist
-    // 2. Filter out tracks already in playlist
+    // Get existing tracks (URIs + names + durations) from playlist.
+    const playlistId = getPlaylistIdFromUri(playlistUri);
+    if (!playlistId) {
+      console.error("[ERROR] Could not extract playlist ID from URI for reading existing tracks");
+      Spicetify.showNotification("Failed to read playlist tracks – invalid playlist URI", true);
+      return;
+    }
+
+    let existingTracks: PlaylistTrackInfo[] = [];
+    try {
+      existingTracks = await fetchAllPlaylistTracks(playlistId);
+    } catch (err) {
+      console.error("[ERROR] Failed to fetch full playlist tracks:", err);
+      Spicetify.showNotification("Failed to read playlist tracks", true);
+      return
+    }
+
+    const existingTrackUris = new Set<string>(existingTracks.map(t => t.uri));
+    const existingTrackKeys = new Set<string>(
+      existingTracks.map(t => makeTrackKey(t.name, t.durationMs)),
+    );
+
+    // 2. Filter out tracks already in playlist (by URI or by smart key)
+    const newTrackUris: string[] = [];
+    const seenArtistTrackKeys = new Set<string>();
+
+    for (const track of allArtistTracks) {
+      const uri = track.uri;
+      if (!uri) continue;
+
+      // Skip exact URI duplicates
+      if (existingTrackUris.has(uri)) continue;
+
+      // Build smart key based on normalized name + duration bucket,
+      // mirroring the matching approach from SpotifyPlaylistUpdater
+      const key = makeTrackKey(track.name, track.durationMs);
+
+      // Skip if playlist already has an equivalent track or we've queued it already
+      if (existingTrackKeys.has(key)) continue;
+      if (seenArtistTrackKeys.has(key)) continue;
+
+      seenArtistTrackKeys.add(key);
+      newTrackUris.push(uri);
+    }
+
+    if (newTrackUris.length === 0) {
+      Spicetify.showNotification("No new tracks to add – playlist already up to date");
+      return;
+    }
+
     // 3. Add missing tracks to playlist using CosmosAsync POST
+    const chunkSize = 100;
+    for (let i = 0; i < newTrackUris.length; i += chunkSize) {
+      const chunk = newTrackUris.slice(i, i + chunkSize);
+      try {
+        await Spicetify.CosmosAsync.post(
+          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+          { uris: chunk },
+        );
+      } catch (error) {
+        console.error("[ERROR] Failed to add tracks chunk to playlist:", error);
+      }
+    }
 
-    Spicetify.showNotification(`Found ${allArtistTracks.length} tracks from artists!`);
+    Spicetify.showNotification(`Added ${newTrackUris.length} tracks to the playlist!`);
   } catch (error) {
     console.error("Error updating playlist:", error);
     Spicetify.showNotification("Failed to update playlist", true);
@@ -363,16 +438,11 @@ async function updatePlaylist(uris: string[]) {
 }
 
 async function main() {
-  console.log("[DEBUG] Playlist Manager initializing...");
 
   while (!Spicetify?.showNotification) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
 
-  console.log("[DEBUG] Spicetify is ready");
-  console.log("[DEBUG] Available GraphQL Definitions:", Object.keys(Spicetify.GraphQL?.Definitions || {}));
-
-  // Create context menu items
   const cleanPlaylistItem = new Spicetify.ContextMenu.Item(
     "Clean Playlist",
     cleanPlaylist,
@@ -387,11 +457,8 @@ async function main() {
     "playlist"
   );
 
-  // Register the menu items
-  console.log("[DEBUG] Registering context menu items...");
   cleanPlaylistItem.register();
   updatePlaylistItem.register();
-  console.log("[DEBUG] Context menu items registered successfully");
 
   Spicetify.showNotification("Playlist Manager loaded!");
 }
