@@ -326,7 +326,7 @@ async function updatePlaylist(uris: string[]) {
   }
 
   try {
-    Spicetify.showNotification("Updating playlist...");
+    Spicetify.showNotification("Updating playlist… fetching playlist data");
 
     const playlist = await getPlaylistData(playlistUri);
 
@@ -344,6 +344,8 @@ async function updatePlaylist(uris: string[]) {
       return;
     }
 
+    Spicetify.showNotification(`Found ${artistNames.length} artist(s)… searching on Spotify`);
+
     const artistUris: string[] = [];
     for (const artistName of artistNames) {
       const artistUri = await searchArtist(artistName);
@@ -359,11 +361,17 @@ async function updatePlaylist(uris: string[]) {
       return;
     }
 
+    Spicetify.showNotification(`Found ${artistUris.length} artist profile(s)… loading discographies`);
+
     const allArtistTracks: ArtistTrack[] = [];
-    for (const artistUri of artistUris) {
+    for (let index = 0; index < artistUris.length; index++) {
+      const artistUri = artistUris[index];
+      Spicetify.showNotification(`Fetching tracks for artist ${index + 1}/${artistUris.length}…`);
       const tracks = await getArtistTracks(artistUri);
       allArtistTracks.push(...tracks);
     }
+
+    Spicetify.showNotification(`Fetched ${allArtistTracks.length} artist track(s)… reading playlist tracks`);
 
 
     // Get existing tracks (URIs + names + durations) from playlist.
@@ -382,6 +390,8 @@ async function updatePlaylist(uris: string[]) {
       Spicetify.showNotification("Failed to read playlist tracks", true);
       return
     }
+
+    Spicetify.showNotification(`Loaded ${existingTracks.length} existing playlist track(s)… comparing`);
 
     const existingTrackUris = new Set<string>(existingTracks.map(t => t.uri));
     const existingTrackKeys = new Set<string>(
@@ -421,6 +431,7 @@ async function updatePlaylist(uris: string[]) {
     for (let i = 0; i < newTrackUris.length; i += chunkSize) {
       const chunk = newTrackUris.slice(i, i + chunkSize);
       try {
+        Spicetify.showNotification(`Adding tracks ${i + 1}-${Math.min(i + chunk.length, newTrackUris.length)} of ${newTrackUris.length}…`);
         await Spicetify.CosmosAsync.post(
           `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
           { uris: chunk },
