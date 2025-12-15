@@ -1,7 +1,6 @@
 // ============== Constants ==============
 
 const DURATION_TOLERANCE_MS = 5000; // 5 seconds tolerance for duration comparison
-const DURATION_BUCKET_MS = 5000; // 5 second buckets for track key generation
 const API_BATCH_SIZE = 50; // Spotify API batch size limit
 
 // ============== URI Helpers ==============
@@ -62,7 +61,7 @@ function normalizeTrackName(name: string): string {
 function makeTrackKey(name: string, durationMs: number | undefined): string {
   const normalizedName = normalizeTrackName(name);
   const safeDuration = typeof durationMs === "number" && !isNaN(durationMs) ? durationMs : 0;
-  const durationBucket = Math.round(safeDuration / DURATION_BUCKET_MS);
+  const durationBucket = Math.round(safeDuration / DURATION_TOLERANCE_MS);
   return `${normalizedName}::${durationBucket}`;
 }
 
@@ -230,7 +229,56 @@ function getTrackToKeepIndex(group: DuplicateGroup): number {
 
 // ============== API Functions ==============
 
+// Fast playlist fetch using Platform API (like Shuffle+)
 async function fetchAllPlaylistTracks(playlistId: string): Promise<PlaylistTrack[]> {
+  const result: PlaylistTrack[] = [];
+
+  try {
+    // Use Platform.PlaylistAPI for faster fetching (single call, no manual pagination)
+    const res = await Spicetify.Platform.PlaylistAPI.getContents(
+      `spotify:playlist:${playlistId}`,
+      { limit: 9999999 }
+    );
+
+    if (!res?.items) {
+      // Fallback to REST API if Platform API fails
+      return fetchAllPlaylistTracksREST(playlistId);
+    }
+
+    let trackIndex = 0;
+    for (const item of res.items) {
+      const uri = item?.uri;
+      const name = item?.name;
+      const durationMs = item?.duration?.milliseconds ?? 0;
+      const artists = (item?.artists ?? []).map((a: any) => a.name).filter(Boolean);
+      const isLocal = item?.isLocal ?? uri?.startsWith("spotify:local:") ?? false;
+      const isExplicit = item?.isExplicit ?? false;
+      const albumImageUrl = item?.album?.images?.[0]?.url ?? item?.images?.[0]?.url;
+
+      if (uri && name) {
+        result.push({
+          uri,
+          name,
+          durationMs,
+          artists,
+          isLocal,
+          isExplicit,
+          albumImageUrl,
+          index: trackIndex,
+        });
+      }
+      trackIndex++;
+    }
+  } catch (error) {
+    console.error("[ERROR] Platform API failed, falling back to REST:", error);
+    return fetchAllPlaylistTracksREST(playlistId);
+  }
+
+  return result;
+}
+
+// Fallback REST API method
+async function fetchAllPlaylistTracksREST(playlistId: string): Promise<PlaylistTrack[]> {
   const result: PlaylistTrack[] = [];
   let offset = 0;
   let trackIndex = 0;
@@ -373,19 +421,30 @@ async function removeTracksFromLikedSongs(trackUris: string[]): Promise<void> {
 }
 
 async function addTracksToPlaylist(playlistId: string, trackUris: string[]): Promise<void> {
-  for (let i = 0; i < trackUris.length; i += API_BATCH_SIZE) {
-    const chunk = trackUris.slice(i, i + API_BATCH_SIZE);
-    const progress = `${i + 1}-${Math.min(i + chunk.length, trackUris.length)} of ${trackUris.length}`;
+  const playlistUri = `spotify:playlist:${playlistId}`;
 
-    Spicetify.showNotification(`Adding tracks ${progress}…`);
+  try {
+    // Use Platform.PlaylistAPI for faster adding (handles batching internally)
+    await Spicetify.Platform.PlaylistAPI.add(playlistUri, trackUris, { after: "end" });
+    Spicetify.showNotification(`Adding ${trackUris.length} tracks…`);
+  } catch (error) {
+    console.error("[ERROR] Platform API failed, falling back to REST:", error);
 
-    try {
-      await Spicetify.CosmosAsync.post(
-        `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
-        { uris: chunk }
-      );
-    } catch (error) {
-      console.error("[ERROR] Failed to add tracks chunk to playlist:", error);
+    // Fallback to REST API with manual batching
+    for (let i = 0; i < trackUris.length; i += API_BATCH_SIZE) {
+      const chunk = trackUris.slice(i, i + API_BATCH_SIZE);
+      const progress = `${i + 1}-${Math.min(i + chunk.length, trackUris.length)} of ${trackUris.length}`;
+
+      Spicetify.showNotification(`Adding tracks ${progress}…`);
+
+      try {
+        await Spicetify.CosmosAsync.post(
+          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+          { uris: chunk }
+        );
+      } catch (restError) {
+        console.error("[ERROR] Failed to add tracks chunk to playlist:", restError);
+      }
     }
   }
 }
@@ -394,23 +453,39 @@ async function removeTracksFromPlaylist(
   playlistId: string,
   tracksToRemove: { uri: string; positions: number[] }[]
 ): Promise<void> {
-  // Sort by position descending to avoid index shifting issues
-  const sorted = [...tracksToRemove].sort((a, b) => b.positions[0] - a.positions[0]);
+  const playlistUri = `spotify:playlist:${playlistId}`;
 
-  for (let i = 0; i < sorted.length; i += API_BATCH_SIZE) {
-    const batch = sorted.slice(i, i + API_BATCH_SIZE);
-    const tracksPayload = batch.map(item => ({
+  try {
+    // Use Platform.PlaylistAPI for faster removal
+    // Convert to format expected by PlaylistAPI.remove
+    const uidsToRemove = tracksToRemove.map(item => ({
       uri: item.uri,
-      positions: item.positions,
+      uid: item.positions[0].toString() // Use position as uid
     }));
 
-    try {
-      await Spicetify.CosmosAsync.del(
-        `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
-        { tracks: tracksPayload }
-      );
-    } catch (error) {
-      console.error("[ERROR] Failed to remove tracks batch:", error);
+    await Spicetify.Platform.PlaylistAPI.remove(playlistUri, uidsToRemove);
+  } catch (error) {
+    console.error("[ERROR] Platform API failed, falling back to REST:", error);
+
+    // Fallback to REST API
+    // Sort by position descending to avoid index shifting issues
+    const sorted = [...tracksToRemove].sort((a, b) => b.positions[0] - a.positions[0]);
+
+    for (let i = 0; i < sorted.length; i += API_BATCH_SIZE) {
+      const batch = sorted.slice(i, i + API_BATCH_SIZE);
+      const tracksPayload = batch.map(item => ({
+        uri: item.uri,
+        positions: item.positions,
+      }));
+
+      try {
+        await Spicetify.CosmosAsync.del(
+          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+          { tracks: tracksPayload }
+        );
+      } catch (restError) {
+        console.error("[ERROR] Failed to remove tracks batch:", restError);
+      }
     }
   }
 }
