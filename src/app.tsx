@@ -11,6 +11,20 @@ function shouldAddToPlaylist(uris: string[]): boolean {
   return Spicetify.URI.isPlaylistV1OrV2(uris[0]);
 }
 
+function shouldAddToLikedSongs(uris: string[]): boolean {
+  if (!uris || uris.length === 0) return false;
+
+  const uriObj = Spicetify.URI.fromString(uris[0]);
+  const type = uriObj?.type;
+
+  // Only show on the Liked Songs collection itself (spotify:collection:tracks)
+  if (type === Spicetify.URI.Type.COLLECTION || type === "collection") {
+    return uriObj?.category === "tracks";
+  }
+
+  return false;
+}
+
 function getPlaylistUri(uris: string[]): string | null {
   if (!uris || uris.length === 0) return null;
   return uris[0];
@@ -280,6 +294,84 @@ async function getPlaylistData(playlistUri: string): Promise<any | null> {
   }
 }
 
+async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
+  const result: PlaylistTrack[] = [];
+
+  try {
+    // Use the internal Cosmos API to fetch Liked Songs
+    const res = await Spicetify.CosmosAsync.get(
+      "sp://core-collection/unstable/@/list/tracks/all?responseFormat=protobufJson"
+    );
+
+    if (!res?.item) {
+      return result;
+    }
+
+    let trackIndex = 0;
+    for (const item of res.item) {
+      const trackMeta = item?.trackMetadata;
+      if (!trackMeta) {
+        trackIndex++;
+        continue;
+      }
+
+      const uri = trackMeta.link;
+      const name = trackMeta.name;
+      const durationMs = trackMeta.length ?? 0;
+      const artists = (trackMeta.artist ?? []).map((a: any) => a.name).filter(Boolean);
+      const isLocal = uri?.startsWith("spotify:local:") ?? false;
+      const isExplicit = trackMeta.isExplicit ?? false;
+      const albumImageUrl = trackMeta.album?.image?.[0]?.fileUri;
+      const isPlayable = trackMeta.playable ?? true;
+
+      if (uri && name && isPlayable) {
+        result.push({
+          uri,
+          name,
+          durationMs,
+          artists,
+          isLocal,
+          isExplicit,
+          albumImageUrl,
+          index: trackIndex,
+        });
+      }
+      trackIndex++;
+    }
+  } catch (error) {
+    console.error("[ERROR] Failed to fetch Liked Songs:", error);
+  }
+
+  return result;
+}
+
+async function removeTracksFromLikedSongs(trackUris: string[]): Promise<void> {
+  // Use the LibraryAPI to remove tracks from Liked Songs
+  for (let i = 0; i < trackUris.length; i += API_BATCH_SIZE) {
+    const batch = trackUris.slice(i, i + API_BATCH_SIZE);
+
+    try {
+      // Use Spicetify's Platform LibraryAPI to unlike tracks
+      await Spicetify.Platform.LibraryAPI.remove({ uris: batch });
+    } catch (error) {
+      console.error("[ERROR] Failed to remove tracks from Liked Songs:", error);
+
+      // Fallback to REST API
+      try {
+        const ids = batch
+          .map(uri => uri.split(':').pop())
+          .filter(Boolean)
+          .join(',');
+        await Spicetify.CosmosAsync.del(
+          `https://api.spotify.com/v1/me/tracks?ids=${ids}`
+        );
+      } catch (fallbackError) {
+        console.error("[ERROR] Fallback removal also failed:", fallbackError);
+      }
+    }
+  }
+}
+
 async function addTracksToPlaylist(playlistId: string, trackUris: string[]): Promise<void> {
   for (let i = 0; i < trackUris.length; i += API_BATCH_SIZE) {
     const chunk = trackUris.slice(i, i + API_BATCH_SIZE);
@@ -398,6 +490,65 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
   } catch (error) {
     console.error("[ERROR] Error cleaning playlist:", error);
     Spicetify.showNotification("Failed to clean playlist", true);
+  }
+}
+
+async function cleanLikedSongs(): Promise<void> {
+  try {
+    Spicetify.showNotification("Scanning Liked Songs for duplicates…");
+
+    const tracks = await fetchAllLikedSongsTracks();
+
+    if (tracks.length === 0) {
+      Spicetify.showNotification("Liked Songs is empty", true);
+      return;
+    }
+
+    const duplicateGroups = findDuplicates(tracks);
+
+    if (duplicateGroups.length === 0) {
+      Spicetify.showNotification("No duplicates found in Liked Songs!");
+      return;
+    }
+
+    // Collect track URIs to remove (keep the best track from each group)
+    const trackUrisToRemove: string[] = [];
+
+    for (const group of duplicateGroups) {
+      // Sort by position to prefer keeping earlier tracks
+      group.tracks.sort((a, b) => a.index - b.index);
+
+      const keepIndex = getTrackToKeepIndex(group);
+      const keptTrack = group.tracks[keepIndex];
+
+      console.log(
+        `[Duplicate] Keeping "${keptTrack.name}" ` +
+        `(${keptTrack.isExplicit ? "explicit" : "clean"}, ` +
+        `${keptTrack.isLocal ? "local" : "spotify"}), ` +
+        `removing ${group.tracks.length - 1} duplicate(s)`
+      );
+
+      // Mark all other tracks for removal
+      for (let i = 0; i < group.tracks.length; i++) {
+        if (i !== keepIndex) {
+          trackUrisToRemove.push(group.tracks[i].uri);
+        }
+      }
+    }
+
+    if (trackUrisToRemove.length === 0) {
+      Spicetify.showNotification("No duplicates to remove!");
+      return;
+    }
+
+    Spicetify.showNotification(`Found ${trackUrisToRemove.length} duplicate(s), removing…`);
+
+    await removeTracksFromLikedSongs(trackUrisToRemove);
+
+    Spicetify.showNotification(`Removed ${trackUrisToRemove.length} duplicate(s) from Liked Songs!`);
+  } catch (error) {
+    console.error("[ERROR] Error cleaning Liked Songs:", error);
+    Spicetify.showNotification("Failed to clean Liked Songs", true);
   }
 }
 
@@ -706,8 +857,16 @@ async function main(): Promise<void> {
     "playlist"
   );
 
+  const cleanLikedSongsItem = new Spicetify.ContextMenu.Item(
+    "Clean Liked Songs",
+    cleanLikedSongs,
+    shouldAddToLikedSongs,
+    "heart-active"
+  );
+
   cleanPlaylistItem.register();
   updatePlaylistItem.register();
+  cleanLikedSongsItem.register();
 }
 
 export default main;
