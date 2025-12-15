@@ -36,9 +36,213 @@ function makeTrackKey(name: string, durationMs: number | undefined): string {
   const safeDuration = typeof durationMs === "number" && !isNaN(durationMs) ? durationMs : 0;
 
   // Bucket duration in ~3 second windows to allow small timing differences
-  const durationBucket = Math.round(safeDuration / 3000);
+  const durationBucket = Math.round(safeDuration / 5000);
 
   return `${normalizedName}::${durationBucket}`;
+}
+
+// ============== Duplicate Detection Types & Helpers ==============
+
+type PlaylistTrack = {
+  uri: string;
+  name: string;
+  durationMs: number;
+  artists: string[];
+  isLocal: boolean;
+  isExplicit: boolean;
+  albumImageUrl?: string;
+  index: number; // Position in playlist
+};
+
+type DuplicateGroup = {
+  tracks: PlaylistTrack[];
+  displayName: string;
+  displayArtist: string;
+  displayImage?: string;
+};
+
+// Duration tolerance: 3 seconds (3000ms)
+const DURATION_TOLERANCE_MS = 3000;
+
+function isDurationWithinRange(duration1: number, duration2: number): boolean {
+  return Math.abs(duration1 - duration2) <= DURATION_TOLERANCE_MS;
+}
+
+function findDuplicates(tracks: PlaylistTrack[]): DuplicateGroup[] {
+  if (!tracks || tracks.length === 0) return [];
+
+  // First, group tracks by normalized name (case-insensitive)
+  const tracksByNormalizedName = new Map<string, PlaylistTrack[]>();
+
+  for (const track of tracks) {
+    const normalizedName = normalizeTrackName(track.name);
+    const existing = tracksByNormalizedName.get(normalizedName) || [];
+    existing.push(track);
+    tracksByNormalizedName.set(normalizedName, existing);
+  }
+
+  // Filter to groups with more than one track
+  const duplicatesGrouped: DuplicateGroup[] = [];
+  for (const [, groupTracks] of tracksByNormalizedName) {
+    if (groupTracks.length > 1) {
+      duplicatesGrouped.push({
+        tracks: groupTracks,
+        displayName: groupTracks[0].name,
+        displayArtist: groupTracks[0].artists.join(", "),
+        displayImage: groupTracks[0].albumImageUrl,
+      });
+    }
+  }
+
+  // Then, filter for exact duplicates with same artists and similar duration
+  return findExactDuplicates(duplicatesGrouped);
+}
+
+function findExactDuplicates(duplicatesGrouped: DuplicateGroup[]): DuplicateGroup[] {
+  const result: DuplicateGroup[] = [];
+
+  for (const group of duplicatesGrouped) {
+    // Group by artists (case-insensitive)
+    const tracksByArtists = new Map<string, PlaylistTrack[]>();
+
+    for (const track of group.tracks) {
+      const artistKey = track.artists.map(a => a.toLowerCase()).sort().join(",");
+      const existing = tracksByArtists.get(artistKey) || [];
+      existing.push(track);
+      tracksByArtists.set(artistKey, existing);
+    }
+
+    // For each artist group, check duration similarity
+    for (const [, artistTracks] of tracksByArtists) {
+      if (artistTracks.length <= 1) continue;
+
+      // Group by similar duration
+      const durationGroups: PlaylistTrack[][] = [];
+
+      for (const track of artistTracks) {
+        let added = false;
+
+        for (const durationGroup of durationGroups) {
+          if (isDurationWithinRange(track.durationMs, durationGroup[0].durationMs)) {
+            durationGroup.push(track);
+            added = true;
+            break;
+          }
+        }
+
+        if (!added) {
+          durationGroups.push([track]);
+        }
+      }
+
+      // Add groups with multiple tracks to results
+      for (const durationGroup of durationGroups) {
+        if (durationGroup.length > 1) {
+          result.push({
+            tracks: durationGroup,
+            displayName: durationGroup[0].name,
+            displayArtist: durationGroup[0].artists.join(", "),
+            displayImage: durationGroup[0].albumImageUrl,
+          });
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+function getTrackToKeepIndex(group: DuplicateGroup): number {
+  // Default to first track (which has lowest playlist index due to sorting)
+  let indexToKeep = 0;
+
+  // First, check if there's a mix of local and Spotify tracks
+  const hasLocalTracks = group.tracks.some(t => t.isLocal);
+  const hasSpotifyTracks = group.tracks.some(t => !t.isLocal);
+
+  // If there's a mix, prioritize Spotify tracks over local files
+  if (hasLocalTracks && hasSpotifyTracks) {
+    for (let i = 0; i < group.tracks.length; i++) {
+      if (!group.tracks[i].isLocal) {
+        indexToKeep = i;
+        break;
+      }
+    }
+  }
+
+  // Then check for explicit tracks, but only among Spotify tracks
+  // (local tracks don't have reliable IsExplicit information)
+  const spotifyTracks = group.tracks.filter(t => !t.isLocal);
+
+  if (spotifyTracks.length <= 0) {
+    return indexToKeep;
+  }
+
+  const hasExplicitTracks = spotifyTracks.some(t => t.isExplicit);
+  const allTracksExplicit = spotifyTracks.every(t => t.isExplicit);
+
+  // If there's a mix of explicit and non-explicit tracks, prioritize keeping an explicit one
+  if (hasExplicitTracks && !allTracksExplicit) {
+    for (let i = 0; i < group.tracks.length; i++) {
+      if (!group.tracks[i].isLocal && group.tracks[i].isExplicit) {
+        indexToKeep = i;
+        break;
+      }
+    }
+  }
+
+  return indexToKeep;
+}
+
+async function fetchAllPlaylistTracksWithDetails(playlistId: string): Promise<PlaylistTrack[]> {
+  const result: PlaylistTrack[] = [];
+  let offset = 0;
+  const limit = 100;
+  let trackIndex = 0;
+
+  while (true) {
+    const page = await Spicetify.CosmosAsync.get(
+      `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=${limit}&offset=${offset}`
+    );
+
+    const items = page?.items ?? [];
+    if (items.length === 0) break;
+
+    for (const item of items) {
+      const trackObj = item?.track;
+      if (!trackObj) {
+        trackIndex++;
+        continue;
+      }
+
+      const uri = trackObj.uri;
+      const name = trackObj.name;
+      const durationMs = trackObj.duration_ms ?? 0;
+      const artists = (trackObj.artists ?? []).map((a: any) => a.name).filter(Boolean);
+      const isLocal = trackObj.is_local ?? uri?.startsWith("spotify:local:") ?? false;
+      const isExplicit = trackObj.explicit ?? false;
+      const albumImageUrl = trackObj.album?.images?.[0]?.url;
+
+      if (uri && name) {
+        result.push({
+          uri,
+          name,
+          durationMs,
+          artists,
+          isLocal,
+          isExplicit,
+          albumImageUrl,
+          index: trackIndex,
+        });
+      }
+      trackIndex++;
+    }
+
+    if (!page.next) break;
+    offset += limit;
+  }
+
+  return result;
 }
 
 type PlaylistTrackInfo = {
@@ -114,18 +318,90 @@ async function cleanPlaylist(uris: string[]) {
     return;
   }
 
+  const playlistId = getPlaylistIdFromUri(playlistUri);
+  if (!playlistId) {
+    console.error("[ERROR] Could not extract playlist ID from URI");
+    Spicetify.showNotification("Invalid playlist URI", true);
+    return;
+  }
+
   try {
-    Spicetify.showNotification("Cleaning playlist...");
+    Spicetify.showNotification("Scanning playlist for duplicates...");
 
-    const playlist = await getPlaylistData(playlistUri);
+    // Fetch all tracks with detailed information
+    const tracks = await fetchAllPlaylistTracksWithDetails(playlistId);
 
-    if (!playlist) {
-      Spicetify.showNotification("Failed to fetch playlist data", true);
+    if (tracks.length === 0) {
+      Spicetify.showNotification("Playlist is empty", true);
       return;
     }
 
+    // Find duplicate groups
+    const duplicateGroups = findDuplicates(tracks);
 
-    Spicetify.showNotification("Playlist cleaned successfully!");
+    if (duplicateGroups.length === 0) {
+      Spicetify.showNotification("No duplicates found!");
+      return;
+    }
+
+    // Collect URIs to remove (keep the best track from each group)
+    const urisToRemove: { uri: string; positions: number[] }[] = [];
+
+    for (const group of duplicateGroups) {
+      // Sort by playlist position to prefer keeping earlier tracks
+      group.tracks.sort((a, b) => a.index - b.index);
+
+      const keepIndex = getTrackToKeepIndex(group);
+
+      // Mark all other tracks for removal
+      for (let i = 0; i < group.tracks.length; i++) {
+        if (i !== keepIndex) {
+          const track = group.tracks[i];
+          urisToRemove.push({
+            uri: track.uri,
+            positions: [track.index],
+          });
+        }
+      }
+
+      console.log(
+        `[Duplicate] Keeping "${group.tracks[keepIndex].name}" ` +
+        `(${group.tracks[keepIndex].isExplicit ? "explicit" : "clean"}, ` +
+        `${group.tracks[keepIndex].isLocal ? "local" : "spotify"}), ` +
+        `removing ${group.tracks.length - 1} duplicate(s)`
+      );
+    }
+
+    if (urisToRemove.length === 0) {
+      Spicetify.showNotification("No duplicates to remove!");
+      return;
+    }
+
+    Spicetify.showNotification(`Found ${urisToRemove.length} duplicate(s), removing...`);
+
+    // Sort by position descending to avoid index shifting issues
+    urisToRemove.sort((a, b) => b.positions[0] - a.positions[0]);
+
+    // Remove duplicates in batches
+    const batchSize = 100;
+    for (let i = 0; i < urisToRemove.length; i += batchSize) {
+      const batch = urisToRemove.slice(i, i + batchSize);
+      const tracksPayload = batch.map(item => ({
+        uri: item.uri,
+        positions: item.positions,
+      }));
+
+      try {
+        await Spicetify.CosmosAsync.del(
+          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
+          { tracks: tracksPayload }
+        );
+      } catch (error) {
+        console.error("[ERROR] Failed to remove tracks batch:", error);
+      }
+    }
+
+    Spicetify.showNotification(`Removed ${urisToRemove.length} duplicate(s) from playlist!`);
   } catch (error) {
     console.error("Error cleaning playlist:", error);
     Spicetify.showNotification("Failed to clean playlist", true);
