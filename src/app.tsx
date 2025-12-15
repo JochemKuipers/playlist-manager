@@ -708,8 +708,6 @@ async function main(): Promise<void> {
 
   cleanPlaylistItem.register();
   updatePlaylistItem.register();
-
-  Spicetify.showNotification("Playlist Manager loaded!");
 }
 
 export default main;
