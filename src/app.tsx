@@ -228,117 +228,34 @@ function getTrackToKeepIndex(group: DuplicateGroup): number {
 }
 
 // ============== API Functions ==============
+async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
+  const res = await Spicetify.Platform.PlaylistAPI.getContents(`spotify:playlist:${uri}`, {
+    limit: 9999999,
+  });
+  const filtered = res.items.filter((track: { isPlayable: any; }) => track.isPlayable);
 
-// Fast playlist fetch using Platform API (like Shuffle+)
-async function fetchAllPlaylistTracks(playlistId: string): Promise<PlaylistTrack[]> {
-  const result: PlaylistTrack[] = [];
-
-  try {
-    // Use Platform.PlaylistAPI for faster fetching (single call, no manual pagination)
-    const res = await Spicetify.Platform.PlaylistAPI.getContents(
-      `spotify:playlist:${playlistId}`,
-      { limit: 9999999 }
-    );
-
-    if (!res?.items) {
-      // Fallback to REST API if Platform API fails
-      return fetchAllPlaylistTracksREST(playlistId);
-    }
-
-    let trackIndex = 0;
-    for (const item of res.items) {
-      const uri = item?.uri;
-      const name = item?.name;
-      const durationMs = item?.duration?.milliseconds ?? 0;
-      const artists = (item?.artists ?? []).map((a: any) => a.name).filter(Boolean);
-      const isLocal = item?.isLocal ?? uri?.startsWith("spotify:local:") ?? false;
-      const isExplicit = item?.isExplicit ?? false;
-      const albumImageUrl = item?.album?.images?.[0]?.url ?? item?.images?.[0]?.url;
-
-      if (uri && name) {
-        result.push({
-          uri,
-          name,
-          durationMs,
-          artists,
-          isLocal,
-          isExplicit,
-          albumImageUrl,
-          index: trackIndex,
-        });
-      }
-      trackIndex++;
-    }
-  } catch (error) {
-    console.error("[ERROR] Platform API failed, falling back to REST:", error);
-    return fetchAllPlaylistTracksREST(playlistId);
-  }
-
-  return result;
+  return filtered.map((track: any, index: number) => ({
+    uri: track.uri,
+    name: track.name,
+    durationMs: track.duration_ms,
+    artists: track.artists.map((a: any) => a.name).filter(Boolean),
+    isLocal: track.uri.startsWith("spotify:local:"),
+    isExplicit: track.is_explicit,
+    albumImageUrl: track.album?.images?.[0]?.url,
+    index,
+  }));
 }
 
-// Fallback REST API method
-async function fetchAllPlaylistTracksREST(playlistId: string): Promise<PlaylistTrack[]> {
-  const result: PlaylistTrack[] = [];
-  let offset = 0;
-  let trackIndex = 0;
-
-  while (true) {
-    const page = await Spicetify.CosmosAsync.get(
-      `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=${API_BATCH_SIZE}&offset=${offset}`
-    );
-
-    const items = page?.items ?? [];
-    if (items.length === 0) break;
-
-    for (const item of items) {
-      const trackObj = item?.track;
-      if (!trackObj) {
-        trackIndex++;
-        continue;
-      }
-
-      const uri = trackObj.uri;
-      const name = trackObj.name;
-      const durationMs = trackObj.duration_ms ?? 0;
-      const artists = (trackObj.artists ?? []).map((a: any) => a.name).filter(Boolean);
-      const isLocal = trackObj.is_local ?? uri?.startsWith("spotify:local:") ?? false;
-      const isExplicit = trackObj.explicit ?? false;
-      const albumImageUrl = trackObj.album?.images?.[0]?.url;
-
-      if (uri && name) {
-        result.push({
-          uri,
-          name,
-          durationMs,
-          artists,
-          isLocal,
-          isExplicit,
-          albumImageUrl,
-          index: trackIndex,
-        });
-      }
-      trackIndex++;
-    }
-
-    if (!page.next) break;
-    offset += API_BATCH_SIZE;
-  }
-
-  return result;
-}
 
 async function getPlaylistData(playlistUri: string): Promise<any | null> {
-  const playlistId = getPlaylistIdFromUri(playlistUri);
-  if (!playlistId) return null;
-
   try {
-    return await Spicetify.CosmosAsync.get(
-      `https://api.spotify.com/v1/playlists/${playlistId}`
-    );
+    // Try Platform API first - should have metadata
+    const metadata = await Spicetify.Platform.PlaylistAPI.getMetadata(playlistUri);
+    if (metadata?.name) {
+      return metadata;
+    }
   } catch (error) {
-    console.error("[ERROR] Failed to fetch playlist data:", error);
-    return null;
+    console.log("[INFO] Platform metadata API not available, trying alternatives:", error);
   }
 }
 
@@ -500,17 +417,10 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
     return;
   }
 
-  const playlistId = getPlaylistIdFromUri(playlistUri);
-  if (!playlistId) {
-    console.error("[ERROR] Could not extract playlist ID from URI");
-    Spicetify.showNotification("Invalid playlist URI", true);
-    return;
-  }
-
   try {
     Spicetify.showNotification("Scanning playlist for duplicates…");
 
-    const tracks = await fetchAllPlaylistTracks(playlistId);
+    const tracks = await fetchPlaylistTracks(playlistUri);
 
     if (tracks.length === 0) {
       Spicetify.showNotification("Playlist is empty", true);
@@ -558,6 +468,12 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
     }
 
     Spicetify.showNotification(`Found ${tracksToRemove.length} duplicate(s), removing…`);
+
+    const playlistId = getPlaylistIdFromUri(playlistUri);
+    if (!playlistId) {
+      Spicetify.showNotification("Invalid playlist URI", true);
+      return;
+    }
 
     await removeTracksFromPlaylist(playlistId, tracksToRemove);
 
@@ -812,13 +728,6 @@ async function updatePlaylist(uris: string[]): Promise<void> {
     return;
   }
 
-  const playlistId = getPlaylistIdFromUri(playlistUri);
-  if (!playlistId) {
-    console.error("[ERROR] Could not extract playlist ID from URI");
-    Spicetify.showNotification("Invalid playlist URI", true);
-    return;
-  }
-
   try {
     Spicetify.showNotification("Updating playlist… fetching playlist data");
 
@@ -829,6 +738,7 @@ async function updatePlaylist(uris: string[]): Promise<void> {
     }
 
     const playlistName = playlist.name || playlist.displayName || "";
+
     const artistNames = parseArtistsFromTitle(playlistName);
 
     if (artistNames.length === 0) {
@@ -867,7 +777,7 @@ async function updatePlaylist(uris: string[]): Promise<void> {
     Spicetify.showNotification(`Fetched ${allArtistTracks.length} artist track(s)… reading playlist tracks`);
 
     // Get existing tracks
-    const existingTracks = await fetchAllPlaylistTracks(playlistId);
+    const existingTracks = await fetchPlaylistTracks(playlistUri);
 
     Spicetify.showNotification(`Loaded ${existingTracks.length} existing playlist track(s)… comparing`);
 
@@ -897,6 +807,12 @@ async function updatePlaylist(uris: string[]): Promise<void> {
 
     if (newTrackUris.length === 0) {
       Spicetify.showNotification("No new tracks to add – playlist already up to date");
+      return;
+    }
+
+    const playlistId = getPlaylistIdFromUri(playlistUri);
+    if (!playlistId) {
+      Spicetify.showNotification("Invalid playlist URI", true);
       return;
     }
 
