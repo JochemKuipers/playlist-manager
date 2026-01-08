@@ -117,13 +117,6 @@ function normalizeTrackName(name: string): string {
   return normalized;
 }
 
-function makeTrackKey(name: string, durationMs: number | undefined): string {
-  const normalizedName = normalizeTrackName(name);
-  const safeDuration = typeof durationMs === "number" && !isNaN(durationMs) ? durationMs : 0;
-  const durationBucket = Math.round(safeDuration / DURATION_TOLERANCE_MS);
-  return `${normalizedName}::${durationBucket}`;
-}
-
 function isDurationWithinRange(duration1: number | undefined, duration2: number | undefined): boolean {
   const d1 = Number.isFinite(duration1) ? Number(duration1) : null;
   const d2 = Number.isFinite(duration2) ? Number(duration2) : null;
@@ -132,6 +125,39 @@ function isDurationWithinRange(duration1: number | undefined, duration2: number 
   if (d1 === null || d2 === null) return true;
 
   return Math.abs(d1 - d2) <= DURATION_TOLERANCE_MS;
+}
+
+function normalizeDuration(durationMs: number | undefined): number | null {
+  if (typeof durationMs === "number" && !Number.isNaN(durationMs)) {
+    return durationMs;
+  }
+  return null;
+}
+
+function hasDurationMatch(
+  map: Map<string, Array<number | null>>,
+  normalizedName: string,
+  duration: number | null
+): boolean {
+  const durations = map.get(normalizedName);
+  if (!durations) return false;
+
+  for (const existingDuration of durations) {
+    if (existingDuration === null || duration === null) return true;
+    if (Math.abs(existingDuration - duration) <= DURATION_TOLERANCE_MS) return true;
+  }
+
+  return false;
+}
+
+function addDurationEntry(
+  map: Map<string, Array<number | null>>,
+  normalizedName: string,
+  duration: number | null
+): void {
+  const durations = map.get(normalizedName) ?? [];
+  durations.push(duration);
+  map.set(normalizedName, durations);
 }
 
 // ============== Types ==============
@@ -798,11 +824,17 @@ async function updatePlaylist(uris: string[]): Promise<void> {
 
     // Build lookup sets for existing tracks
     const existingTrackUris = new Set(existingTracks.map(t => t.uri));
-    const existingTrackKeys = new Set(existingTracks.map(t => makeTrackKey(t.name, t.durationMs)));
+    const existingTracksByName = new Map<string, Array<number | null>>();
+
+    for (const track of existingTracks) {
+      const normalizedName = normalizeTrackName(track.name);
+      const duration = normalizeDuration(track.durationMs);
+      addDurationEntry(existingTracksByName, normalizedName, duration);
+    }
 
     // Filter out tracks already in playlist
     const newTrackUris: string[] = [];
-    const seenArtistTrackKeys = new Set<string>();
+    const pendingTracksByName = new Map<string, Array<number | null>>();
 
     for (const track of allArtistTracks) {
       if (!track.uri) continue;
@@ -810,13 +842,16 @@ async function updatePlaylist(uris: string[]): Promise<void> {
       // Skip exact URI duplicates
       if (existingTrackUris.has(track.uri)) continue;
 
-      // Build smart key based on normalized name + duration bucket
-      const key = makeTrackKey(track.name, track.durationMs);
+      const normalizedName = normalizeTrackName(track.name);
+      const duration = normalizeDuration(track.durationMs);
 
-      // Skip if playlist already has an equivalent track or we've queued it
-      if (existingTrackKeys.has(key) || seenArtistTrackKeys.has(key)) continue;
+      // Skip if playlist already has an equivalent track (name + duration tolerance)
+      if (hasDurationMatch(existingTracksByName, normalizedName, duration)) continue;
 
-      seenArtistTrackKeys.add(key);
+      // Skip if we already plan to add an equivalent track in this update
+      if (hasDurationMatch(pendingTracksByName, normalizedName, duration)) continue;
+
+      addDurationEntry(pendingTracksByName, normalizedName, duration);
       newTrackUris.push(track.uri);
     }
 
