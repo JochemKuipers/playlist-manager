@@ -263,7 +263,6 @@ async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
   const result: PlaylistTrack[] = [];
 
   try {
-    // Use the internal Cosmos API to fetch Liked Songs
     const res = await Spicetify.CosmosAsync.get(
       "sp://core-collection/unstable/@/list/tracks/all?responseFormat=protobufJson"
     );
@@ -320,19 +319,6 @@ async function removeTracksFromLikedSongs(trackUris: string[]): Promise<void> {
       await Spicetify.Platform.LibraryAPI.remove({ uris: batch });
     } catch (error) {
       console.error("[ERROR] Failed to remove tracks from Liked Songs:", error);
-
-      // Fallback to REST API
-      try {
-        const ids = batch
-          .map(uri => uri.split(':').pop())
-          .filter(Boolean)
-          .join(',');
-        await Spicetify.CosmosAsync.del(
-          `https://api.spotify.com/v1/me/tracks?ids=${ids}`
-        );
-      } catch (fallbackError) {
-        console.error("[ERROR] Fallback removal also failed:", fallbackError);
-      }
     }
   }
 }
@@ -345,24 +331,7 @@ async function addTracksToPlaylist(playlistId: string, trackUris: string[]): Pro
     await Spicetify.Platform.PlaylistAPI.add(playlistUri, trackUris, { after: "end" });
     Spicetify.showNotification(`Adding ${trackUris.length} tracks…`);
   } catch (error) {
-    console.error("[ERROR] Platform API failed, falling back to REST:", error);
-
-    // Fallback to REST API with manual batching
-    for (let i = 0; i < trackUris.length; i += API_BATCH_SIZE) {
-      const chunk = trackUris.slice(i, i + API_BATCH_SIZE);
-      const progress = `${i + 1}-${Math.min(i + chunk.length, trackUris.length)} of ${trackUris.length}`;
-
-      Spicetify.showNotification(`Adding tracks ${progress}…`);
-
-      try {
-        await Spicetify.CosmosAsync.post(
-          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
-          { uris: chunk }
-        );
-      } catch (restError) {
-        console.error("[ERROR] Failed to add tracks chunk to playlist:", restError);
-      }
-    }
+    console.error("[ERROR] Platform API failed:", error);
   }
 }
 
@@ -382,28 +351,7 @@ async function removeTracksFromPlaylist(
 
     await Spicetify.Platform.PlaylistAPI.remove(playlistUri, uidsToRemove);
   } catch (error) {
-    console.error("[ERROR] Platform API failed, falling back to REST:", error);
-
-    // Fallback to REST API
-    // Sort by position descending to avoid index shifting issues
-    const sorted = [...tracksToRemove].sort((a, b) => b.positions[0] - a.positions[0]);
-
-    for (let i = 0; i < sorted.length; i += API_BATCH_SIZE) {
-      const batch = sorted.slice(i, i + API_BATCH_SIZE);
-      const tracksPayload = batch.map(item => ({
-        uri: item.uri,
-        positions: item.positions,
-      }));
-
-      try {
-        await Spicetify.CosmosAsync.del(
-          `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
-          { tracks: tracksPayload }
-        );
-      } catch (restError) {
-        console.error("[ERROR] Failed to remove tracks batch:", restError);
-      }
-    }
+    console.error("[ERROR] Platform API failed:", error);
   }
 }
 
@@ -575,57 +523,15 @@ async function searchArtist(artistName: string): Promise<string | null> {
   return null;
 }
 
-async function getArtistDiscography(artistId: string): Promise<ArtistAlbum[]> {
-  const artistAlbumQuery = Spicetify.GraphQL.Definitions.queryArtistDiscographyAll;
-
-  // Try GraphQL first, fall back to REST API
-  if (artistAlbumQuery) {
-    return getArtistDiscographyGraphQL(artistId, artistAlbumQuery);
-  }
-
-  return getArtistDiscographyREST(artistId);
-}
-
-async function getArtistDiscographyREST(artistId: string): Promise<ArtistAlbum[]> {
-  const includeGroups = "album,single,appears_on";
-  const discog: ArtistAlbum[] = [];
-  let offset = 0;
-
-  while (true) {
-    const response = await Spicetify.CosmosAsync.get(
-      `https://api.spotify.com/v1/artists/${artistId}/albums?include_groups=${includeGroups}&limit=50&offset=${offset}`
-    );
-
-    for (const album of response.items) {
-      let releaseDate = album.release_date.replace(/-/g, "");
-      while (releaseDate.length < 8) {
-        releaseDate += "0";
-      }
-
-      discog.push({
-        id: album.id,
-        name: album.name,
-        date: releaseDate,
-        albumType: album.album_type,
-      });
-    }
-
-    if (!response.next) break;
-    offset += 50;
-  }
-
-  discog.sort((a, b) => a.date.localeCompare(b.date));
-  return discog;
-}
-
-async function getArtistDiscographyGraphQL(
+async function getArtistDiscography(
   artistId: string,
-  artistAlbumQuery: any
 ): Promise<ArtistAlbum[]> {
   const discog: ArtistAlbum[] = [];
   const seenAlbumIds = new Set<string>();
   let offset = 0;
   let hasNextPage = true;
+  const artistAlbumQuery = Spicetify.GraphQL.Definitions.queryArtistDiscographyAll;
+
 
   while (hasNextPage) {
     try {
