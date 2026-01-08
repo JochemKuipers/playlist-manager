@@ -611,24 +611,32 @@ function parseArtistsFromTitle(title: string): string[] {
 }
 
 async function searchArtist(artistName: string): Promise<string | null> {
+  const normalizedQuery = artistName.trim().toLowerCase();
+
+  // Prefer GraphQL searchArtists
   try {
-    const result = await fetchWithClientCredentials(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=10`
-    );
+    const def = Spicetify.GraphQL.Definitions.searchArtists;
+    const response = await Spicetify.GraphQL.Request(def, {
+      searchTerm: artistName,
+      limit: 10,
+    });
 
-    if (result?.artists?.items?.length > 0) {
-      const normalizedQuery = artistName.trim().toLowerCase();
+    const items = response?.data?.searchV2?.artists?.items
+      ?? response?.data?.search?.artists?.items
+      ?? [];
 
-      // Try to find exact match first
-      const exactMatch = result.artists.items.find(
-        (artist: any) => artist.name.trim().toLowerCase() === normalizedQuery
-      );
+    const candidates = items
+      .map((item: any) => item?.data ?? item)
+      .filter(Boolean);
 
-      const foundUri = exactMatch?.uri ?? result.artists.items[0].uri;
-      return foundUri;
+    if (candidates.length > 0) {
+      const exact = candidates.find((artist: any) => artist?.profile?.name?.trim?.().toLowerCase() === normalizedQuery);
+      const uriFrom = (artist: any) => artist?.uri;
+      const foundUri = uriFrom(exact) ?? uriFrom(candidates[0]);
+      if (foundUri) return foundUri;
     }
   } catch (error) {
-    console.error(`[ERROR] Client credentials search failed for ${artistName}:`, error);
+    console.warn(`[WARN] GraphQL searchArtists failed for ${artistName}, falling back to Web API:`, error);
   }
 
   return null;
