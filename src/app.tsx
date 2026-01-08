@@ -145,6 +145,8 @@ type PlaylistTrack = {
   isExplicit: boolean;
   albumImageUrl?: string;
   index: number;
+  uid?: string;
+  rowId?: string;
 };
 
 type DuplicateGroup = {
@@ -310,6 +312,8 @@ async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
     isLocal: track.uri.startsWith("spotify:local:"),
     isExplicit: track.is_explicit,
     albumImageUrl: track.album?.images?.[0]?.url,
+    uid: track.uid ?? track.rowId ?? track.rowid,
+    rowId: track.rowId ?? track.rowid,
     index,
   }));
 }
@@ -405,17 +409,28 @@ async function addTracksToPlaylist(playlistId: string, trackUris: string[]): Pro
 
 async function removeTracksFromPlaylist(
   playlistId: string,
-  tracksToRemove: { uri: string; positions: number[] }[]
+  tracksToRemove: { uri: string; uid?: string; rowId?: string }[]
 ): Promise<void> {
   const playlistUri = `spotify:playlist:${playlistId}`;
 
   try {
     // Use Platform.PlaylistAPI for faster removal
     // Convert to format expected by PlaylistAPI.remove
-    const uidsToRemove = tracksToRemove.map(item => ({
-      uri: item.uri,
-      uid: item.positions[0].toString() // Use position as uid
-    }));
+    const uidsToRemove = tracksToRemove
+      .map(item => {
+        const uid = item.uid || item.rowId;
+        if (!uid) {
+          console.warn(`[WARN] Skipping removal for ${item.uri} because uid/rowId is missing`);
+          return null;
+        }
+        return { uri: item.uri, uid };
+      })
+      .filter(Boolean) as { uri: string; uid: string }[];
+
+    if (uidsToRemove.length === 0) {
+      console.warn("[WARN] No removable items with valid uid/rowId");
+      return;
+    }
 
     await Spicetify.Platform.PlaylistAPI.remove(playlistUri, uidsToRemove);
   } catch (error) {
@@ -451,7 +466,7 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
     }
 
     // Collect tracks to remove (keep the best track from each group)
-    const tracksToRemove: { uri: string; positions: number[] }[] = [];
+    const tracksToRemove: { uri: string; uid?: string; rowId?: string }[] = [];
 
     for (const group of duplicateGroups) {
       // Sort by playlist position to prefer keeping earlier tracks
@@ -472,7 +487,8 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
         if (i !== keepIndex) {
           tracksToRemove.push({
             uri: group.tracks[i].uri,
-            positions: [group.tracks[i].index],
+            uid: group.tracks[i].uid,
+            rowId: group.tracks[i].rowId,
           });
         }
       }
