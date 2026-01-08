@@ -2,6 +2,65 @@
 
 const DURATION_TOLERANCE_MS = 5000; // 5 seconds tolerance for duration comparison
 const API_BATCH_SIZE = 50; // Spotify API batch size limit
+const CLIENT_ID = "235d6b1970794b92b39c008451f5ec5b";
+const CLIENT_SECRET = "dcfd525311274466bcf53f918ff745f9";
+
+// ============== Client Credentials Token Management ==============
+
+let clientCredentialsToken: string | null = null;
+let tokenExpiryTime: number = 0;
+
+async function getClientCredentialsToken(): Promise<string | null> {
+  // Return cached token if still valid
+  if (clientCredentialsToken && Date.now() < tokenExpiryTime) {
+    return clientCredentialsToken;
+  }
+
+  try {
+    const response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": `Basic ${btoa(`${CLIENT_ID}:${CLIENT_SECRET}`)}`
+      },
+      body: "grant_type=client_credentials"
+    });
+
+    if (!response.ok) {
+      throw new Error(`Token request failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+    clientCredentialsToken = data.access_token;
+    // Set expiry to 5 minutes before actual expiry for safety
+    tokenExpiryTime = Date.now() + (data.expires_in - 300) * 1000;
+
+    console.log("[INFO] Obtained new client credentials token");
+    return clientCredentialsToken;
+  } catch (error) {
+    console.error("[ERROR] Failed to get client credentials token:", error);
+    return null;
+  }
+}
+
+async function fetchWithClientCredentials(url: string): Promise<any> {
+  const token = await getClientCredentialsToken();
+  if (!token) {
+    throw new Error("Failed to obtain client credentials token");
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      "Authorization": `Bearer ${token}`
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status}`);
+  }
+
+  return await response.json();
+}
 
 // ============== URI Helpers ==============
 
@@ -229,7 +288,10 @@ function getTrackToKeepIndex(group: DuplicateGroup): number {
 
 // ============== API Functions ==============
 async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
-  const res = await Spicetify.Platform.PlaylistAPI.getContents(`spotify:playlist:${uri}`, {
+  // Ensure we have a proper playlist URI format
+  const playlistUri = uri.startsWith('spotify:playlist:') ? uri : `spotify:playlist:${uri}`;
+
+  const res = await Spicetify.Platform.PlaylistAPI.getContents(playlistUri, {
     limit: 9999999,
   });
   const filtered = res.items.filter((track: { isPlayable: any; }) => track.isPlayable);
@@ -502,7 +564,7 @@ function parseArtistsFromTitle(title: string): string[] {
 
 async function searchArtist(artistName: string): Promise<string | null> {
   try {
-    const result = await Spicetify.CosmosAsync.get(
+    const result = await fetchWithClientCredentials(
       `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=10`
     );
 
@@ -514,14 +576,16 @@ async function searchArtist(artistName: string): Promise<string | null> {
         (artist: any) => artist.name.trim().toLowerCase() === normalizedQuery
       );
 
-      return exactMatch?.uri ?? result.artists.items[0].uri;
+      const foundUri = exactMatch?.uri ?? result.artists.items[0].uri;
+      return foundUri;
     }
   } catch (error) {
-    console.error(`[ERROR] Failed to search for artist: ${artistName}`, error);
+    console.error(`[ERROR] Client credentials search failed for ${artistName}:`, error);
   }
 
   return null;
 }
+
 
 async function getArtistDiscography(
   artistId: string,
@@ -575,35 +639,45 @@ async function getTracksFromDiscography(discography: ArtistAlbum[]): Promise<Art
   const tracks: ArtistTrack[] = [];
   const seenTrackIds = new Set<string>();
 
+
   for (const album of discography) {
-    let offset = 0;
-    const limit = 50;
+    // Try GraphQL first if available
+    const queryAlbumTracks = Spicetify.GraphQL?.Definitions?.queryAlbumTracks;
 
-    while (true) {
-      const res = await Spicetify.CosmosAsync.get(
-        `https://api.spotify.com/v1/albums/${album.id}/tracks?limit=${limit}&offset=${offset}`,
-      );
-
-      const items = res?.items ?? [];
-      if (items.length === 0) break;
-
-      for (const t of items) {
-        if (seenTrackIds.has(t.id)) continue;
-        seenTrackIds.add(t.id);
-
-        tracks.push({
-          id: t.id,
-          name: t.name,
-          uri: t.uri,
-          albumId: album.id,
-          albumName: album.name,
-          trackNumber: t.track_number,
-          durationMs: t.duration_ms,
+    if (queryAlbumTracks) {
+      try {
+        const { data, errors } = await Spicetify.GraphQL.Request(queryAlbumTracks, {
+          uri: `spotify:album:${album.id}`,
+          offset: 0,
+          limit: 100,
         });
-      }
 
-      if (!res.next) break;
-      offset += limit;
+        if (errors) {
+          throw new Error(errors[0]?.message || "GraphQL error");
+        }
+
+        const items = data?.albumUnion?.tracksV2?.items || data?.albumUnion?.tracks?.items || [];
+
+        for (const item of items) {
+          const track = item.track || item;
+
+          const trackId = track.uri ? track.uri.split(':').pop() : null;
+          if (!trackId || seenTrackIds.has(trackId)) continue;
+          seenTrackIds.add(trackId);
+
+          tracks.push({
+            id: trackId,
+            name: track.name,
+            uri: track.uri,
+            albumId: album.id,
+            albumName: album.name,
+            trackNumber: track.trackNumber || track.track_number || 0,
+            durationMs: track.duration?.totalMilliseconds || track.durationMs || track.duration_ms || 0,
+          });
+        }
+      } catch (error) {
+        console.error(`[ERROR] GraphQL failed for album ${album.id}:`, error);
+      }
     }
   }
 
@@ -619,7 +693,8 @@ async function getArtistTracks(artistUri: string): Promise<ArtistTrack[]> {
 
   try {
     const discography = await getArtistDiscography(artistId);
-    return await getTracksFromDiscography(discography);
+    const tracks = await getTracksFromDiscography(discography);
+    return tracks;
   } catch (error) {
     console.error("[ERROR] Failed to fetch artist tracks:", error);
     return [];
