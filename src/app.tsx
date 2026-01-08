@@ -124,8 +124,14 @@ function makeTrackKey(name: string, durationMs: number | undefined): string {
   return `${normalizedName}::${durationBucket}`;
 }
 
-function isDurationWithinRange(duration1: number, duration2: number): boolean {
-  return Math.abs(duration1 - duration2) <= DURATION_TOLERANCE_MS;
+function isDurationWithinRange(duration1: number | undefined, duration2: number | undefined): boolean {
+  const d1 = Number.isFinite(duration1) ? Number(duration1) : null;
+  const d2 = Number.isFinite(duration2) ? Number(duration2) : null;
+
+  // If either duration is missing, assume a match to avoid suppressing duplicates due to absent metadata.
+  if (d1 === null || d2 === null) return true;
+
+  return Math.abs(d1 - d2) <= DURATION_TOLERANCE_MS;
 }
 
 // ============== Types ==============
@@ -639,6 +645,12 @@ async function getTracksFromDiscography(discography: ArtistAlbum[]): Promise<Art
   const tracks: ArtistTrack[] = [];
   const seenTrackIds = new Set<string>();
 
+  const getDurationMs = (track: any): number | null => {
+    const raw = track?.duration?.totalMilliseconds ?? track?.durationMs ?? track?.duration_ms;
+    if (typeof raw === "number" && !Number.isNaN(raw) && raw > 0) return raw;
+    return null;
+  };
+
 
   for (const album of discography) {
     // Try GraphQL first if available
@@ -665,6 +677,12 @@ async function getTracksFromDiscography(discography: ArtistAlbum[]): Promise<Art
           if (!trackId || seenTrackIds.has(trackId)) continue;
           seenTrackIds.add(trackId);
 
+          const durationMs = getDurationMs(track);
+          if (!durationMs) {
+            console.warn(`[WARN] Skipping track without duration: ${track.name} (${track.uri})`);
+            continue;
+          }
+
           tracks.push({
             id: trackId,
             name: track.name,
@@ -672,7 +690,7 @@ async function getTracksFromDiscography(discography: ArtistAlbum[]): Promise<Art
             albumId: album.id,
             albumName: album.name,
             trackNumber: track.trackNumber || track.track_number || 0,
-            durationMs: track.duration?.totalMilliseconds || track.durationMs || track.duration_ms || 0,
+            durationMs,
           });
         }
       } catch (error) {
