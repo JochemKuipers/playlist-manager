@@ -2,65 +2,6 @@
 
 const DURATION_TOLERANCE_MS = 5000; // 5 seconds tolerance for duration comparison
 const API_BATCH_SIZE = 50; // Spotify API batch size limit
-const CLIENT_ID = "235d6b1970794b92b39c008451f5ec5b";
-const CLIENT_SECRET = "dcfd525311274466bcf53f918ff745f9";
-
-// ============== Client Credentials Token Management ==============
-
-let clientCredentialsToken: string | null = null;
-let tokenExpiryTime: number = 0;
-
-async function getClientCredentialsToken(): Promise<string | null> {
-  // Return cached token if still valid
-  if (clientCredentialsToken && Date.now() < tokenExpiryTime) {
-    return clientCredentialsToken;
-  }
-
-  try {
-    const response = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": `Basic ${btoa(`${CLIENT_ID}:${CLIENT_SECRET}`)}`
-      },
-      body: "grant_type=client_credentials"
-    });
-
-    if (!response.ok) {
-      throw new Error(`Token request failed: ${response.status}`);
-    }
-
-    const data = await response.json();
-    clientCredentialsToken = data.access_token;
-    // Set expiry to 5 minutes before actual expiry for safety
-    tokenExpiryTime = Date.now() + (data.expires_in - 300) * 1000;
-
-    console.log("[INFO] Obtained new client credentials token");
-    return clientCredentialsToken;
-  } catch (error) {
-    console.error("[ERROR] Failed to get client credentials token:", error);
-    return null;
-  }
-}
-
-async function fetchWithClientCredentials(url: string): Promise<any> {
-  const token = await getClientCredentialsToken();
-  if (!token) {
-    throw new Error("Failed to obtain client credentials token");
-  }
-
-  const response = await fetch(url, {
-    headers: {
-      "Authorization": `Bearer ${token}`
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
-  }
-
-  return await response.json();
-}
 
 // ============== URI Helpers ==============
 
