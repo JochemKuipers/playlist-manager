@@ -554,18 +554,45 @@ function parseArtistsFromTitle(title: string): string[] {
 async function searchArtist(artistName: string): Promise<string | null> {
   const normalizedQuery = artistName.trim().toLowerCase();
 
-  // Prefer GraphQL searchArtists
+  // First, try searchArtists
+  try {
+    const def = Spicetify.GraphQL.Definitions.searchArtists;
+    const response = await Spicetify.GraphQL.Request(def, {
+      searchTerm: artistName,
+      limit: 10,
+      offset: 0,
+    });
+
+    const items = response?.data?.searchV2?.artists?.items
+      ?? response?.data?.search?.artists?.items
+      ?? [];
+
+    const candidates = items
+      .map((item: any) => item?.data ?? item)
+      .filter(Boolean);
+
+    if (candidates.length > 0) {
+      const exact = candidates.find((artist: any) => artist?.profile?.name?.trim?.().toLowerCase() === normalizedQuery);
+      const uriFrom = (artist: any) => artist?.uri;
+      const foundUri = uriFrom(exact) ?? uriFrom(candidates[0]);
+      if (foundUri) return foundUri;
+    }
+  } catch (error) {
+    console.warn(`[WARN] GraphQL searchArtists failed for ${artistName}:`, error);
+  }
+
+  // If searchArtists fails, try searchDesktop as a fallback
   try {
     const def = Spicetify.GraphQL.Definitions.searchDesktop;
     const response = await Spicetify.GraphQL.Request(def, {
+      searchTerm: artistName,
+      offset: 0,
+      limit: 10,
+      numberOfTopResults: 5,
       includeArtistHasConcertsField: false,
       includeAudiobooks: false,
       includeAuthors: false,
       includePreReleases: false,
-      searchTerm: artistName,
-      limit: 10,
-      numberOfTopResults: 5,
-      offset: 0,
     });
 
     const items = response?.data?.searchV2?.artists?.items
