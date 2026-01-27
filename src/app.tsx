@@ -556,10 +556,16 @@ async function searchArtist(artistName: string): Promise<string | null> {
 
   // Prefer GraphQL searchArtists
   try {
-    const def = Spicetify.GraphQL.Definitions.searchArtists;
+    const def = Spicetify.GraphQL.Definitions.searchDesktop;
     const response = await Spicetify.GraphQL.Request(def, {
+      includeArtistHasConcertsField: false,
+      includeAudiobooks: false,
+      includeAuthors: false,
+      includePreReleases: false,
       searchTerm: artistName,
       limit: 10,
+      numberOfTopResults: 5,
+      offset: 0,
     });
 
     const items = response?.data?.searchV2?.artists?.items
@@ -577,7 +583,7 @@ async function searchArtist(artistName: string): Promise<string | null> {
       if (foundUri) return foundUri;
     }
   } catch (error) {
-    console.warn(`[WARN] GraphQL searchArtists failed for ${artistName}, falling back to Web API:`, error);
+    console.warn(`[WARN] GraphQL searchDesktop failed for ${artistName}:`, error);
   }
 
   return null;
