@@ -5,23 +5,42 @@ const API_BATCH_SIZE = 50; // Spotify API batch size limit
 
 // ============== URI Helpers ==============
 
-function shouldAddToPlaylist(uris: string[]): boolean {
-  if (!uris || uris.length === 0) return false;
-  return Spicetify.URI.isPlaylistV1OrV2(uris[0]);
-}
+const LIKED_SONGS_PLAYLIST_IDS = new Set([
+  // Desktop client sometimes exposes Liked Songs as this synthetic playlist.
+  "37i9dQZF1F5p3rmiWPIYgZ",
+]);
 
-function shouldAddToLikedSongs(uris: string[]): boolean {
-  if (!uris || uris.length === 0) return false;
+function isLikedSongsUri(uri?: string): boolean {
+  if (!uri) return false;
+  if (uri === "spotify:collection:tracks") return true;
 
-  const uriObj = Spicetify.URI.fromString(uris[0]);
+  const uriObj = Spicetify.URI.fromString(uri);
   const type = uriObj?.type;
 
-  // Only show on the Liked Songs collection itself (spotify:collection:tracks)
   if (type === Spicetify.URI.Type.COLLECTION || type === "collection") {
     return uriObj?.category === "tracks";
   }
 
+  if (
+    (type === Spicetify.URI.Type.PLAYLIST_V2 || type === "playlist-v2" || type === Spicetify.URI.Type.PLAYLIST || type === "playlist")
+    && uriObj?.id
+  ) {
+    return LIKED_SONGS_PLAYLIST_IDS.has(uriObj.id);
+  }
+
   return false;
+}
+
+function shouldAddToPlaylist(uris: string[], _uids?: string[], contextUri?: string): boolean {
+  const targetUri = contextUri ?? uris?.[0];
+  if (!targetUri) return false;
+  if (isLikedSongsUri(targetUri)) return false;
+  return Spicetify.URI.isPlaylistV1OrV2(targetUri);
+}
+
+function shouldAddToLikedSongs(uris: string[], _uids?: string[], contextUri?: string): boolean {
+  const targetUri = contextUri ?? uris?.[0];
+  return isLikedSongsUri(targetUri);
 }
 
 function getPlaylistUri(uris: string[]): string | null {
