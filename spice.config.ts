@@ -9,6 +9,7 @@ export default defineConfig({
   template: "extension",
   packageManager: "bun",
   esbuildOptions: {
+    format: "iife",
     alias: {
       "@": resolve(__dirname, "src"),
     },

@@ -938,4 +938,4 @@ async function main(): Promise<void> {
   cleanLikedSongsItem.register();
 }
 
-export default main;
+void main();
