@@ -376,32 +376,68 @@ async function addTracksToPlaylist(playlistId: string, trackUris: string[]): Pro
 
 async function removeTracksFromPlaylist(
   playlistId: string,
-  tracksToRemove: { uri: string; uid?: string; rowId?: string }[]
-): Promise<void> {
+  tracksToRemove: { uri: string; uid?: string; rowId?: string; index?: number }[]
+): Promise<number> {
   const playlistUri = `spotify:playlist:${playlistId}`;
 
   try {
-    // Use Platform.PlaylistAPI for faster removal
-    // Convert to format expected by PlaylistAPI.remove
-    const uidsToRemove = tracksToRemove
-      .map(item => {
-        const uid = item.uid || item.rowId;
-        if (!uid) {
-          console.warn(`[WARN] Skipping removal for ${item.uri} because uid/rowId is missing`);
-          return null;
-        }
-        return { uri: item.uri, uid };
-      })
-      .filter(Boolean) as { uri: string; uid: string }[];
-
-    if (uidsToRemove.length === 0) {
-      console.warn("[WARN] No removable items with valid uid/rowId");
-      return;
+    // Resolve removable entries against a fresh playlist snapshot.
+    // This avoids failing the entire request due to stale/invalid row IDs.
+    const latestTracks = await fetchPlaylistTracks(playlistUri);
+    const latestUidsByUri = new Map<string, string[]>();
+    for (const track of latestTracks) {
+      if (!track.uid) continue;
+      const list = latestUidsByUri.get(track.uri) ?? [];
+      list.push(track.uid);
+      latestUidsByUri.set(track.uri, list);
     }
 
-    await Spicetify.Platform.PlaylistAPI.remove(playlistUri, uidsToRemove);
+    const uidsToRemove: { uri: string; uid: string }[] = [];
+    const seen = new Set<string>();
+
+    for (const item of tracksToRemove) {
+      const candidates = latestUidsByUri.get(item.uri);
+      if (!candidates || candidates.length === 0) {
+        console.warn(`[WARN] Skipping removal for ${item.uri} because no matching uid exists in latest playlist state`);
+        continue;
+      }
+
+      const nextUid = candidates.shift();
+      if (!nextUid) continue;
+      if (seen.has(nextUid)) continue;
+
+      seen.add(nextUid);
+      uidsToRemove.push({ uri: item.uri, uid: nextUid });
+    }
+
+    if (uidsToRemove.length === 0) {
+      console.warn("[WARN] No removable items with valid uid");
+      return 0;
+    }
+
+    let removedCount = 0;
+    for (let i = 0; i < uidsToRemove.length; i += API_BATCH_SIZE) {
+      const batch = uidsToRemove.slice(i, i + API_BATCH_SIZE);
+      try {
+        await Spicetify.Platform.PlaylistAPI.remove(playlistUri, batch);
+        removedCount += batch.length;
+      } catch (batchError) {
+        console.warn("[WARN] Batch remove failed, retrying individually:", batchError);
+        for (const item of batch) {
+          try {
+            await Spicetify.Platform.PlaylistAPI.remove(playlistUri, [item]);
+            removedCount += 1;
+          } catch (singleError) {
+            console.warn(`[WARN] Failed to remove ${item.uri} (${item.uid})`, singleError);
+          }
+        }
+      }
+    }
+
+    return removedCount;
   } catch (error) {
     console.error("[ERROR] Platform API failed:", error);
+    return 0;
   }
 }
 
@@ -433,7 +469,7 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
     }
 
     // Collect tracks to remove (keep the best track from each group)
-    const tracksToRemove: { uri: string; uid?: string; rowId?: string }[] = [];
+    const tracksToRemove: { uri: string; uid?: string; rowId?: string; index?: number }[] = [];
 
     for (const group of duplicateGroups) {
       // Sort by playlist position to prefer keeping earlier tracks
@@ -456,6 +492,7 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
             uri: group.tracks[i].uri,
             uid: group.tracks[i].uid,
             rowId: group.tracks[i].rowId,
+            index: group.tracks[i].index,
           });
         }
       }
@@ -474,9 +511,18 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
       return;
     }
 
-    await removeTracksFromPlaylist(playlistId, tracksToRemove);
+    const removedCount = await removeTracksFromPlaylist(playlistId, tracksToRemove);
+    if (removedCount === 0) {
+      Spicetify.showNotification("No duplicates were removed (possibly changed playlist state)", true);
+      return;
+    }
 
-    Spicetify.showNotification(`Removed ${tracksToRemove.length} duplicate(s) from playlist!`);
+    if (removedCount < tracksToRemove.length) {
+      Spicetify.showNotification(`Removed ${removedCount}/${tracksToRemove.length} duplicate(s) from playlist`);
+      return;
+    }
+
+    Spicetify.showNotification(`Removed ${removedCount} duplicate(s) from playlist!`);
   } catch (error) {
     console.error("[ERROR] Error cleaning playlist:", error);
     Spicetify.showNotification("Failed to clean playlist", true);
