@@ -10,6 +10,67 @@ const LIKED_SONGS_PLAYLIST_IDS = new Set([
   "37i9dQZF1F5p3rmiWPIYgZ",
 ]);
 
+const ownedPlaylistUris = new Set<string>();
+let ownershipCacheLoading: Promise<void> | null = null;
+let ownershipCacheReady = false;
+
+function collectPlaylistsFromRootlist(items: any[]): any[] {
+  const playlists: any[] = [];
+  for (const item of items ?? []) {
+    if (!item) continue;
+    if (item.type === "playlist" || item.type === "playlist_v2") {
+      playlists.push(item);
+      continue;
+    }
+    if (item.type === "folder" && Array.isArray(item.items)) {
+      playlists.push(...collectPlaylistsFromRootlist(item.items));
+    }
+  }
+  return playlists;
+}
+
+function isOwnedPlaylistForCurrentUser(playlist: any, currentUser: string): boolean {
+  if (!playlist) return false;
+  if (playlist.isOwnedBySelf === true) return true;
+
+  const owner = playlist.owner ?? {};
+  const ownerUsername = String(owner.username ?? owner.id ?? "");
+  const ownerUri = String(owner.uri ?? "");
+
+  return ownerUsername === currentUser || ownerUri === `spotify:user:${currentUser}`;
+}
+
+async function refreshOwnedPlaylistUris(): Promise<void> {
+  if (ownershipCacheLoading) return ownershipCacheLoading;
+
+  ownershipCacheLoading = (async () => {
+    try {
+      const currentUser = Spicetify.Platform.username;
+      if (!currentUser) {
+        ownershipCacheReady = true;
+        return;
+      }
+
+      const rootlist = await Spicetify.Platform.RootlistAPI.getContents();
+      const playlists = collectPlaylistsFromRootlist(rootlist?.items ?? []);
+
+      ownedPlaylistUris.clear();
+      for (const playlist of playlists) {
+        if (isOwnedPlaylistForCurrentUser(playlist, currentUser)) {
+          ownedPlaylistUris.add(playlist.uri);
+        }
+      }
+    } catch (error) {
+      console.warn("[WARN] Failed to refresh owned playlist cache:", error);
+    } finally {
+      ownershipCacheReady = true;
+      ownershipCacheLoading = null;
+    }
+  })();
+
+  return ownershipCacheLoading;
+}
+
 function isLikedSongsUri(uri?: string): boolean {
   if (!uri) return false;
   if (uri === "spotify:collection:tracks") return true;
@@ -35,7 +96,13 @@ function shouldAddToPlaylist(uris: string[], _uids?: string[], contextUri?: stri
   const targetUri = contextUri ?? uris?.[0];
   if (!targetUri) return false;
   if (isLikedSongsUri(targetUri)) return false;
-  return Spicetify.URI.isPlaylistV1OrV2(targetUri);
+  if (!Spicetify.URI.isPlaylistV1OrV2(targetUri)) return false;
+
+  if (!ownershipCacheReady) {
+    void refreshOwnedPlaylistUris();
+  }
+
+  return ownedPlaylistUris.has(targetUri);
 }
 
 function shouldAddToLikedSongs(uris: string[], _uids?: string[], contextUri?: string): boolean {
@@ -929,6 +996,9 @@ async function main(): Promise<void> {
   while (!Spicetify?.showNotification) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
+
+  // Warm ownership cache for synchronous context-menu visibility checks.
+  void refreshOwnedPlaylistUris();
 
   // Register context menu items
   const cleanPlaylistItem = new Spicetify.ContextMenu.Item(
