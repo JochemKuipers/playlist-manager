@@ -74,8 +74,15 @@ async function refreshOwnedPlaylistUris(): Promise<void> {
 function isLikedSongsUri(uri?: string): boolean {
   if (!uri) return false;
   if (uri === "spotify:collection:tracks") return true;
+  if (uri.includes("collection/tracks")) return true;
 
-  const uriObj = Spicetify.URI.fromString(uri);
+  let uriObj: any = null;
+  try {
+    uriObj = Spicetify.URI.fromString(uri);
+  } catch {
+    return false;
+  }
+
   const type = uriObj?.type;
 
   if (type === Spicetify.URI.Type.COLLECTION || type === "collection") {
@@ -106,8 +113,12 @@ function shouldAddToPlaylist(uris: string[], _uids?: string[], contextUri?: stri
 }
 
 function shouldAddToLikedSongs(uris: string[], _uids?: string[], contextUri?: string): boolean {
-  const targetUri = contextUri ?? uris?.[0];
-  return isLikedSongsUri(targetUri);
+  // Spotify context payloads are inconsistent across surfaces; check all candidates.
+  if (isLikedSongsUri(contextUri)) return true;
+  for (const uri of uris ?? []) {
+    if (isLikedSongsUri(uri)) return true;
+  }
+  return false;
 }
 
 function getPlaylistUri(uris: string[]): string | null {
