@@ -239,7 +239,7 @@ function isDurationWithinRange(
 }
 
 function normalizeDuration(durationMs: number | undefined): number | null {
-  if (typeof durationMs === "number" && !Number.isNaN(durationMs)) {
+  if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0) {
     return durationMs;
   }
   return null;
@@ -260,6 +260,20 @@ function hasDurationMatch(
   }
 
   return false;
+}
+
+/** Update-time skip: same as clean when durations exist; name-only if either side lacks duration. */
+function shouldSkipAddingTrack(
+  map: Map<string, Array<number | null>>,
+  normalizedName: string,
+  duration: number | null,
+): boolean {
+  const durations = map.get(normalizedName);
+  if (!durations || durations.length === 0) return false;
+
+  if (duration === null || durations.some((d) => d === null)) return true;
+
+  return hasDurationMatch(map, normalizedName, duration);
 }
 
 function addDurationEntry(
@@ -456,6 +470,8 @@ async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
     uri: string;
     name: string;
     duration_ms?: number;
+    durationMs?: number;
+    duration?: { milliseconds?: number; totalMilliseconds?: number };
     artists?: Array<{ name?: string }>;
     is_explicit?: boolean;
     album?: { images?: Array<{ url?: string }> };
@@ -464,6 +480,13 @@ async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
     rowid?: string;
   };
 
+  const trackDurationMs = (track: RawTrack) =>
+    track.duration?.milliseconds ??
+    track.duration?.totalMilliseconds ??
+    track.durationMs ??
+    track.duration_ms ??
+    0;
+
   const filtered = (res.items as RawTrack[]).filter(
     (track) => track.isPlayable,
   );
@@ -471,7 +494,7 @@ async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
   return filtered.map((track, index) => ({
     uri: track.uri,
     name: track.name,
-    durationMs: track.duration_ms ?? 0,
+    durationMs: trackDurationMs(track),
     artists: (track.artists ?? [])
       .map((a) => a.name)
       .filter((n): n is string => Boolean(n)),
@@ -965,9 +988,17 @@ async function getArtistDiscography(artistId: string): Promise<ArtistAlbum[]> {
 
 async function getTracksFromDiscography(
   discography: ArtistAlbum[],
+  artistUri: string,
 ): Promise<ArtistTrack[]> {
   const tracks: ArtistTrack[] = [];
   const seenTrackIds = new Set<string>();
+  const artistId = getArtistIdFromUri(artistUri);
+
+  type RawAlbumArtist = {
+    uri?: string;
+    profile?: { name?: string; uri?: string };
+    data?: { uri?: string; profile?: { uri?: string } };
+  };
 
   type RawAlbumTrack = {
     duration?: { totalMilliseconds?: number };
@@ -977,6 +1008,7 @@ async function getTracksFromDiscography(
     name?: string;
     trackNumber?: number;
     track_number?: number;
+    artists?: { items?: RawAlbumArtist[] } | RawAlbumArtist[];
   };
 
   const getDurationMs = (track: RawAlbumTrack): number | null => {
@@ -986,6 +1018,23 @@ async function getTracksFromDiscography(
       track?.duration_ms;
     if (typeof raw === "number" && !Number.isNaN(raw) && raw > 0) return raw;
     return null;
+  };
+
+  const trackCreditsArtist = (track: RawAlbumTrack): boolean => {
+    const rawArtists = track.artists;
+    const items = Array.isArray(rawArtists)
+      ? rawArtists
+      : (rawArtists?.items ?? []);
+
+    // No artist nodes in payload → can't filter; keep (own releases often omit them).
+    if (items.length === 0) return true;
+
+    return items.some((entry) => {
+      const artist = entry?.data ?? entry;
+      const uri = artist?.uri ?? artist?.profile?.uri;
+      if (!uri) return false;
+      return uri === artistUri || uri.split(":").pop() === artistId;
+    });
   };
 
   for (const album of discography) {
@@ -1021,6 +1070,8 @@ async function getTracksFromDiscography(
 
           const trackId = track.uri ? track.uri.split(":").pop() : null;
           if (!trackId || seenTrackIds.has(trackId)) continue;
+          if (!trackCreditsArtist(track)) continue;
+
           seenTrackIds.add(trackId);
 
           const durationMs = getDurationMs(track);
@@ -1063,8 +1114,7 @@ async function getArtistTracks(artistUri: string): Promise<ArtistTrack[]> {
 
   try {
     const discography = await getArtistDiscography(artistId);
-    const tracks = await getTracksFromDiscography(discography);
-    return tracks;
+    return await getTracksFromDiscography(discography, artistUri);
   } catch (error) {
     console.error("[ERROR] Failed to fetch artist tracks:", error);
     return [];
@@ -1166,12 +1216,12 @@ async function updatePlaylist(uris: string[]): Promise<void> {
       const normalizedName = normalizeTrackName(track.name);
       const duration = normalizeDuration(track.durationMs);
 
-      // Skip if playlist already has an equivalent track (name + duration tolerance)
-      if (hasDurationMatch(existingTracksByName, normalizedName, duration))
+      // Skip if playlist already has an equivalent track
+      if (shouldSkipAddingTrack(existingTracksByName, normalizedName, duration))
         continue;
 
       // Skip if we already plan to add an equivalent track in this update
-      if (hasDurationMatch(pendingTracksByName, normalizedName, duration))
+      if (shouldSkipAddingTrack(pendingTracksByName, normalizedName, duration))
         continue;
 
       addDurationEntry(pendingTracksByName, normalizedName, duration);
