@@ -2,6 +2,7 @@
 
 const DURATION_TOLERANCE_MS = 5000; // 5 seconds tolerance for duration comparison
 const API_BATCH_SIZE = 50; // Spotify API batch size limit
+const ALBUM_FETCH_CONCURRENCY = 12; // parallel queryAlbumTracks calls
 
 // ============== URI Helpers ==============
 
@@ -990,9 +991,9 @@ async function getTracksFromDiscography(
   discography: ArtistAlbum[],
   artistUri: string,
 ): Promise<ArtistTrack[]> {
-  const tracks: ArtistTrack[] = [];
-  const seenTrackIds = new Set<string>();
   const artistId = getArtistIdFromUri(artistUri);
+  const queryAlbumTracks = Spicetify.GraphQL?.Definitions?.queryAlbumTracks;
+  if (!queryAlbumTracks || discography.length === 0) return [];
 
   type RawAlbumArtist = {
     uri?: string;
@@ -1037,10 +1038,8 @@ async function getTracksFromDiscography(
     });
   };
 
-  for (const album of discography) {
-    const queryAlbumTracks = Spicetify.GraphQL?.Definitions?.queryAlbumTracks;
-    if (!queryAlbumTracks) continue;
-
+  const fetchAlbumTracks = async (album: ArtistAlbum): Promise<ArtistTrack[]> => {
+    const albumTracks: ArtistTrack[] = [];
     let offset = 0;
     let hasNextPage = true;
 
@@ -1067,22 +1066,13 @@ async function getTracksFromDiscography(
 
         for (const item of items) {
           const track = (item.track || item) as RawAlbumTrack;
-
           const trackId = track.uri ? track.uri.split(":").pop() : null;
-          if (!trackId || seenTrackIds.has(trackId)) continue;
-          if (!trackCreditsArtist(track)) continue;
-
-          seenTrackIds.add(trackId);
+          if (!trackId || !trackCreditsArtist(track)) continue;
 
           const durationMs = getDurationMs(track);
-          if (!durationMs) {
-            console.warn(
-              `[WARN] Skipping track without duration: ${track.name} (${track.uri})`,
-            );
-            continue;
-          }
+          if (!durationMs) continue;
 
-          tracks.push({
+          albumTracks.push({
             id: trackId,
             name: track.name ?? "",
             uri: track.uri ?? "",
@@ -1098,6 +1088,25 @@ async function getTracksFromDiscography(
       } catch (error) {
         console.error(`[ERROR] GraphQL failed for album ${album.id}:`, error);
         break;
+      }
+    }
+
+    return albumTracks;
+  };
+
+  // Liked Songs is one Platform call; discography is 1 GraphQL call per album.
+  // Run albums in parallel with a small pool so pathfinder doesn't get hammered.
+  const tracks: ArtistTrack[] = [];
+  const seenTrackIds = new Set<string>();
+
+  for (let i = 0; i < discography.length; i += ALBUM_FETCH_CONCURRENCY) {
+    const chunk = discography.slice(i, i + ALBUM_FETCH_CONCURRENCY);
+    const batches = await Promise.all(chunk.map((album) => fetchAlbumTracks(album)));
+    for (const batch of batches) {
+      for (const track of batch) {
+        if (seenTrackIds.has(track.id)) continue;
+        seenTrackIds.add(track.id);
+        tracks.push(track);
       }
     }
   }
