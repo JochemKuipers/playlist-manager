@@ -10,12 +10,30 @@ const LIKED_SONGS_PLAYLIST_IDS = new Set([
   "37i9dQZF1F5p3rmiWPIYgZ",
 ]);
 
+const OWNERSHIP_CACHE_TTL_MS = 15_000;
+
 const ownedPlaylistUris = new Set<string>();
 let ownershipCacheLoading: Promise<void> | null = null;
 let ownershipCacheReady = false;
+let ownershipFetchedAt = 0;
 
-function collectPlaylistsFromRootlist(items: any[]): any[] {
-  const playlists: any[] = [];
+function ownershipCacheIsFresh(): boolean {
+  return (
+    ownershipCacheReady &&
+    Date.now() - ownershipFetchedAt < OWNERSHIP_CACHE_TTL_MS
+  );
+}
+
+type RootlistItem = {
+  type?: string;
+  uri?: string;
+  isOwnedBySelf?: boolean;
+  owner?: { username?: string; id?: string; uri?: string };
+  items?: RootlistItem[];
+};
+
+function collectPlaylistsFromRootlist(items: RootlistItem[]): RootlistItem[] {
+  const playlists: RootlistItem[] = [];
   for (const item of items ?? []) {
     if (!item) continue;
     if (item.type === "playlist" || item.type === "playlist_v2") {
@@ -29,18 +47,23 @@ function collectPlaylistsFromRootlist(items: any[]): any[] {
   return playlists;
 }
 
-function isOwnedPlaylistForCurrentUser(playlist: any, currentUser: string): boolean {
-  if (!playlist) return false;
+function isOwnedPlaylistForCurrentUser(
+  playlist: RootlistItem,
+  currentUser: string,
+): boolean {
   if (playlist.isOwnedBySelf === true) return true;
 
   const owner = playlist.owner ?? {};
   const ownerUsername = String(owner.username ?? owner.id ?? "");
   const ownerUri = String(owner.uri ?? "");
 
-  return ownerUsername === currentUser || ownerUri === `spotify:user:${currentUser}`;
+  return (
+    ownerUsername === currentUser || ownerUri === `spotify:user:${currentUser}`
+  );
 }
 
-async function refreshOwnedPlaylistUris(): Promise<void> {
+async function refreshOwnedPlaylistUris(force = false): Promise<void> {
+  if (!force && ownershipCacheIsFresh()) return;
   if (ownershipCacheLoading) return ownershipCacheLoading;
 
   ownershipCacheLoading = (async () => {
@@ -48,6 +71,7 @@ async function refreshOwnedPlaylistUris(): Promise<void> {
       const currentUser = Spicetify.Platform.username;
       if (!currentUser) {
         ownershipCacheReady = true;
+        ownershipFetchedAt = Date.now();
         return;
       }
 
@@ -56,7 +80,10 @@ async function refreshOwnedPlaylistUris(): Promise<void> {
 
       ownedPlaylistUris.clear();
       for (const playlist of playlists) {
-        if (isOwnedPlaylistForCurrentUser(playlist, currentUser)) {
+        if (
+          playlist.uri &&
+          isOwnedPlaylistForCurrentUser(playlist, currentUser)
+        ) {
           ownedPlaylistUris.add(playlist.uri);
         }
       }
@@ -64,6 +91,7 @@ async function refreshOwnedPlaylistUris(): Promise<void> {
       console.warn("[WARN] Failed to refresh owned playlist cache:", error);
     } finally {
       ownershipCacheReady = true;
+      ownershipFetchedAt = Date.now();
       ownershipCacheLoading = null;
     }
   })();
@@ -71,12 +99,34 @@ async function refreshOwnedPlaylistUris(): Promise<void> {
   return ownershipCacheLoading;
 }
 
+function watchOwnedPlaylistChanges(): void {
+  // ponytail: Platform event shapes vary by Spotify build; TTL covers the rest
+  try {
+    const rootlistApi = Spicetify.Platform?.RootlistAPI;
+    const events =
+      rootlistApi?.getEvents?.() ?? rootlistApi?._events ?? rootlistApi;
+    const onUpdate = () => {
+      void refreshOwnedPlaylistUris(true);
+    };
+
+    if (typeof events?.addListener === "function") {
+      events.addListener("update", onUpdate);
+      return;
+    }
+    if (typeof events?.on === "function") {
+      events.on("update", onUpdate);
+    }
+  } catch (error) {
+    console.warn("[WARN] Could not subscribe to rootlist updates:", error);
+  }
+}
+
 function isLikedSongsUri(uri?: string): boolean {
   if (!uri) return false;
   if (uri === "spotify:collection:tracks") return true;
   if (uri.includes("collection/tracks")) return true;
 
-  let uriObj: any = null;
+  let uriObj: ReturnType<typeof Spicetify.URI.fromString> | null = null;
   try {
     uriObj = Spicetify.URI.fromString(uri);
   } catch {
@@ -90,8 +140,11 @@ function isLikedSongsUri(uri?: string): boolean {
   }
 
   if (
-    (type === Spicetify.URI.Type.PLAYLIST_V2 || type === "playlist-v2" || type === Spicetify.URI.Type.PLAYLIST || type === "playlist")
-    && uriObj?.id
+    (type === Spicetify.URI.Type.PLAYLIST_V2 ||
+      type === "playlist-v2" ||
+      type === Spicetify.URI.Type.PLAYLIST ||
+      type === "playlist") &&
+    uriObj?.id
   ) {
     return LIKED_SONGS_PLAYLIST_IDS.has(uriObj.id);
   }
@@ -99,20 +152,37 @@ function isLikedSongsUri(uri?: string): boolean {
   return false;
 }
 
-function shouldAddToPlaylist(uris: string[], _uids?: string[], contextUri?: string): boolean {
+function shouldAddToPlaylist(
+  uris: string[],
+  _uids?: string[],
+  contextUri?: string,
+): boolean {
   const targetUri = contextUri ?? uris?.[0];
   if (!targetUri) return false;
   if (isLikedSongsUri(targetUri)) return false;
   if (!Spicetify.URI.isPlaylistV1OrV2(targetUri)) return false;
 
-  if (!ownershipCacheReady) {
+  if (!ownershipCacheIsFresh()) {
     void refreshOwnedPlaylistUris();
   }
 
+  // Optimistic while warming/refreshing; actions re-check ownership.
+  if (!ownershipCacheReady || !ownershipCacheIsFresh()) return true;
   return ownedPlaylistUris.has(targetUri);
 }
 
-function shouldAddToLikedSongs(uris: string[], _uids?: string[], contextUri?: string): boolean {
+async function ensureOwnedPlaylist(playlistUri: string): Promise<boolean> {
+  if (!ownershipCacheIsFresh()) {
+    await refreshOwnedPlaylistUris();
+  }
+  return ownedPlaylistUris.has(playlistUri);
+}
+
+function shouldAddToLikedSongs(
+  uris: string[],
+  _uids?: string[],
+  contextUri?: string,
+): boolean {
   // Spotify context payloads are inconsistent across surfaces; check all candidates.
   if (isLikedSongsUri(contextUri)) return true;
   for (const uri of uris ?? []) {
@@ -127,12 +197,12 @@ function getPlaylistUri(uris: string[]): string | null {
 }
 
 function getPlaylistIdFromUri(uri: string): string | null {
-  const match = uri.match(/playlist[\/:]([a-zA-Z0-9]+)/);
+  const match = uri.match(/playlist[/:]([a-zA-Z0-9]+)/);
   return match ? match[1] : null;
 }
 
 function getArtistIdFromUri(uri: string): string | null {
-  return uri.split(':').pop() ?? null;
+  return uri.split(":").pop() ?? null;
 }
 
 // ============== Track Name Normalization ==============
@@ -141,12 +211,12 @@ function normalizeTrackName(name: string): string {
   let normalized = name.toLowerCase().trim();
 
   // Remove text in parentheses/brackets (e.g., "(Remastered)", "[Live]")
-  normalized = normalized.replace(/\s*[\(\[].*?[\)\]]/g, "");
+  normalized = normalized.replace(/\s*[([].*?[)\]]/g, "");
 
   // Remove common suffixes like " - remaster", " - live", etc.
   normalized = normalized.replace(
     /\s*-\s*(remaster(ed)?(\s*\d{2,4})?|live|mono|stereo|single version|radio edit).*$/i,
-    ""
+    "",
   );
 
   // Collapse multiple spaces
@@ -155,12 +225,15 @@ function normalizeTrackName(name: string): string {
   return normalized;
 }
 
-function isDurationWithinRange(duration1: number | undefined, duration2: number | undefined): boolean {
+function isDurationWithinRange(
+  duration1: number | undefined,
+  duration2: number | undefined,
+): boolean {
   const d1 = Number.isFinite(duration1) ? Number(duration1) : null;
   const d2 = Number.isFinite(duration2) ? Number(duration2) : null;
 
-  // If either duration is missing, assume a match to avoid suppressing duplicates due to absent metadata.
-  if (d1 === null || d2 === null) return true;
+  // Missing duration ⇒ no match (avoids deleting unrelated same-name tracks).
+  if (d1 === null || d2 === null) return false;
 
   return Math.abs(d1 - d2) <= DURATION_TOLERANCE_MS;
 }
@@ -175,14 +248,15 @@ function normalizeDuration(durationMs: number | undefined): number | null {
 function hasDurationMatch(
   map: Map<string, Array<number | null>>,
   normalizedName: string,
-  duration: number | null
+  duration: number | null,
 ): boolean {
   const durations = map.get(normalizedName);
   if (!durations) return false;
 
   for (const existingDuration of durations) {
-    if (existingDuration === null || duration === null) return true;
-    if (Math.abs(existingDuration - duration) <= DURATION_TOLERANCE_MS) return true;
+    if (existingDuration === null || duration === null) continue;
+    if (Math.abs(existingDuration - duration) <= DURATION_TOLERANCE_MS)
+      return true;
   }
 
   return false;
@@ -191,7 +265,7 @@ function hasDurationMatch(
 function addDurationEntry(
   map: Map<string, Array<number | null>>,
   normalizedName: string,
-  duration: number | null
+  duration: number | null,
 ): void {
   const durations = map.get(normalizedName) ?? [];
   durations.push(duration);
@@ -269,7 +343,9 @@ function findDuplicates(tracks: PlaylistTrack[]): DuplicateGroup[] {
   return findExactDuplicates(duplicatesGrouped);
 }
 
-function findExactDuplicates(duplicatesGrouped: DuplicateGroup[]): DuplicateGroup[] {
+function findExactDuplicates(
+  duplicatesGrouped: DuplicateGroup[],
+): DuplicateGroup[] {
   const result: DuplicateGroup[] = [];
 
   for (const group of duplicatesGrouped) {
@@ -277,7 +353,10 @@ function findExactDuplicates(duplicatesGrouped: DuplicateGroup[]): DuplicateGrou
     const tracksByArtists = new Map<string, PlaylistTrack[]>();
 
     for (const track of group.tracks) {
-      const artistKey = track.artists.map(a => a.toLowerCase()).sort().join(",");
+      const artistKey = track.artists
+        .map((a) => a.toLowerCase())
+        .sort()
+        .join(",");
       const existing = tracksByArtists.get(artistKey) || [];
       existing.push(track);
       tracksByArtists.set(artistKey, existing);
@@ -294,7 +373,9 @@ function findExactDuplicates(duplicatesGrouped: DuplicateGroup[]): DuplicateGrou
         let added = false;
 
         for (const durationGroup of durationGroups) {
-          if (isDurationWithinRange(track.durationMs, durationGroup[0].durationMs)) {
+          if (
+            isDurationWithinRange(track.durationMs, durationGroup[0].durationMs)
+          ) {
             durationGroup.push(track);
             added = true;
             break;
@@ -327,12 +408,12 @@ function getTrackToKeepIndex(group: DuplicateGroup): number {
   // Default to first track (lowest playlist index due to sorting)
   let indexToKeep = 0;
 
-  const hasLocalTracks = group.tracks.some(t => t.isLocal);
-  const hasSpotifyTracks = group.tracks.some(t => !t.isLocal);
+  const hasLocalTracks = group.tracks.some((t) => t.isLocal);
+  const hasSpotifyTracks = group.tracks.some((t) => !t.isLocal);
 
   // Prioritize Spotify tracks over local files
   if (hasLocalTracks && hasSpotifyTracks) {
-    const spotifyIndex = group.tracks.findIndex(t => !t.isLocal);
+    const spotifyIndex = group.tracks.findIndex((t) => !t.isLocal);
     if (spotifyIndex !== -1) {
       indexToKeep = spotifyIndex;
     }
@@ -340,15 +421,17 @@ function getTrackToKeepIndex(group: DuplicateGroup): number {
 
   // Check for explicit tracks among Spotify tracks only
   // (local tracks don't have reliable explicit information)
-  const spotifyTracks = group.tracks.filter(t => !t.isLocal);
+  const spotifyTracks = group.tracks.filter((t) => !t.isLocal);
 
   if (spotifyTracks.length > 0) {
-    const hasExplicitTracks = spotifyTracks.some(t => t.isExplicit);
-    const allTracksExplicit = spotifyTracks.every(t => t.isExplicit);
+    const hasExplicitTracks = spotifyTracks.some((t) => t.isExplicit);
+    const allTracksExplicit = spotifyTracks.every((t) => t.isExplicit);
 
     // Prioritize explicit tracks if there's a mix
     if (hasExplicitTracks && !allTracksExplicit) {
-      const explicitIndex = group.tracks.findIndex(t => !t.isLocal && t.isExplicit);
+      const explicitIndex = group.tracks.findIndex(
+        (t) => !t.isLocal && t.isExplicit,
+      );
       if (explicitIndex !== -1) {
         indexToKeep = explicitIndex;
       }
@@ -361,20 +444,39 @@ function getTrackToKeepIndex(group: DuplicateGroup): number {
 // ============== API Functions ==============
 async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
   // Ensure we have a proper playlist URI format
-  const playlistUri = uri.startsWith('spotify:playlist:') ? uri : `spotify:playlist:${uri}`;
+  const playlistUri = uri.startsWith("spotify:playlist:")
+    ? uri
+    : `spotify:playlist:${uri}`;
 
   const res = await Spicetify.Platform.PlaylistAPI.getContents(playlistUri, {
-    limit: 9999999,
+    limit: -1,
   });
-  const filtered = res.items.filter((track: { isPlayable: any; }) => track.isPlayable);
+  type RawTrack = {
+    isPlayable?: boolean;
+    uri: string;
+    name: string;
+    duration_ms?: number;
+    artists?: Array<{ name?: string }>;
+    is_explicit?: boolean;
+    album?: { images?: Array<{ url?: string }> };
+    uid?: string;
+    rowId?: string;
+    rowid?: string;
+  };
 
-  return filtered.map((track: any, index: number) => ({
+  const filtered = (res.items as RawTrack[]).filter(
+    (track) => track.isPlayable,
+  );
+
+  return filtered.map((track, index) => ({
     uri: track.uri,
     name: track.name,
-    durationMs: track.duration_ms,
-    artists: track.artists.map((a: any) => a.name).filter(Boolean),
+    durationMs: track.duration_ms ?? 0,
+    artists: (track.artists ?? [])
+      .map((a) => a.name)
+      .filter((n): n is string => Boolean(n)),
     isLocal: track.uri.startsWith("spotify:local:"),
-    isExplicit: track.is_explicit,
+    isExplicit: track.is_explicit ?? false,
     albumImageUrl: track.album?.images?.[0]?.url,
     uid: track.uid ?? track.rowId ?? track.rowid,
     rowId: track.rowId ?? track.rowid,
@@ -382,17 +484,22 @@ async function fetchPlaylistTracks(uri: string): Promise<PlaylistTrack[]> {
   }));
 }
 
-
-async function getPlaylistData(playlistUri: string): Promise<any | null> {
+async function getPlaylistData(
+  playlistUri: string,
+): Promise<{ name?: string; displayName?: string } | null> {
   try {
-    // Try Platform API first - should have metadata
-    const metadata = await Spicetify.Platform.PlaylistAPI.getMetadata(playlistUri);
+    const metadata =
+      await Spicetify.Platform.PlaylistAPI.getMetadata(playlistUri);
     if (metadata?.name) {
       return metadata;
     }
   } catch (error) {
-    console.log("[INFO] Platform metadata API not available, trying alternatives:", error);
+    console.log(
+      "[INFO] Platform metadata API not available, trying alternatives:",
+      error,
+    );
   }
+  return null;
 }
 
 async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
@@ -400,7 +507,7 @@ async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
 
   try {
     const res = await Spicetify.CosmosAsync.get(
-      "sp://core-collection/unstable/@/list/tracks/all?responseFormat=protobufJson"
+      "sp://core-collection/unstable/@/list/tracks/all?responseFormat=protobufJson",
     );
 
     if (!res?.item) {
@@ -409,7 +516,17 @@ async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
 
     let trackIndex = 0;
     for (const item of res.item) {
-      const trackMeta = item?.trackMetadata;
+      const trackMeta = item?.trackMetadata as
+        | {
+            link?: string;
+            name?: string;
+            length?: number;
+            artist?: Array<{ name?: string }>;
+            isExplicit?: boolean;
+            album?: { image?: Array<{ fileUri?: string }> };
+            playable?: boolean;
+          }
+        | undefined;
       if (!trackMeta) {
         trackIndex++;
         continue;
@@ -418,7 +535,9 @@ async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
       const uri = trackMeta.link;
       const name = trackMeta.name;
       const durationMs = trackMeta.length ?? 0;
-      const artists = (trackMeta.artist ?? []).map((a: any) => a.name).filter(Boolean);
+      const artists = (trackMeta.artist ?? [])
+        .map((a) => a.name)
+        .filter((n): n is string => Boolean(n));
       const isLocal = uri?.startsWith("spotify:local:") ?? false;
       const isExplicit = trackMeta.isExplicit ?? false;
       const albumImageUrl = trackMeta.album?.image?.[0]?.fileUri;
@@ -445,35 +564,50 @@ async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
   return result;
 }
 
-async function removeTracksFromLikedSongs(trackUris: string[]): Promise<void> {
-  // Use the LibraryAPI to remove tracks from Liked Songs
+async function removeTracksFromLikedSongs(
+  trackUris: string[],
+): Promise<number> {
+  let removedCount = 0;
+
   for (let i = 0; i < trackUris.length; i += API_BATCH_SIZE) {
     const batch = trackUris.slice(i, i + API_BATCH_SIZE);
 
     try {
-      // Use Spicetify's Platform LibraryAPI to unlike tracks
       await Spicetify.Platform.LibraryAPI.remove({ uris: batch });
+      removedCount += batch.length;
     } catch (error) {
       console.error("[ERROR] Failed to remove tracks from Liked Songs:", error);
     }
   }
+
+  return removedCount;
 }
 
-async function addTracksToPlaylist(playlistId: string, trackUris: string[]): Promise<void> {
+async function addTracksToPlaylist(
+  playlistId: string,
+  trackUris: string[],
+): Promise<boolean> {
   const playlistUri = `spotify:playlist:${playlistId}`;
 
   try {
-    // Use Platform.PlaylistAPI for faster adding (handles batching internally)
-    await Spicetify.Platform.PlaylistAPI.add(playlistUri, trackUris, { after: "end" });
-    Spicetify.showNotification(`Adding ${trackUris.length} tracks…`);
+    await Spicetify.Platform.PlaylistAPI.add(playlistUri, trackUris, {
+      after: "end",
+    });
+    return true;
   } catch (error) {
     console.error("[ERROR] Platform API failed:", error);
+    return false;
   }
 }
 
 async function removeTracksFromPlaylist(
   playlistId: string,
-  tracksToRemove: { uri: string; uid?: string; rowId?: string; index?: number }[]
+  tracksToRemove: {
+    uri: string;
+    uid?: string;
+    rowId?: string;
+    index?: number;
+  }[],
 ): Promise<number> {
   const playlistUri = `spotify:playlist:${playlistId}`;
 
@@ -495,7 +629,9 @@ async function removeTracksFromPlaylist(
     for (const item of tracksToRemove) {
       const candidates = latestUidsByUri.get(item.uri);
       if (!candidates || candidates.length === 0) {
-        console.warn(`[WARN] Skipping removal for ${item.uri} because no matching uid exists in latest playlist state`);
+        console.warn(
+          `[WARN] Skipping removal for ${item.uri} because no matching uid exists in latest playlist state`,
+        );
         continue;
       }
 
@@ -519,13 +655,19 @@ async function removeTracksFromPlaylist(
         await Spicetify.Platform.PlaylistAPI.remove(playlistUri, batch);
         removedCount += batch.length;
       } catch (batchError) {
-        console.warn("[WARN] Batch remove failed, retrying individually:", batchError);
+        console.warn(
+          "[WARN] Batch remove failed, retrying individually:",
+          batchError,
+        );
         for (const item of batch) {
           try {
             await Spicetify.Platform.PlaylistAPI.remove(playlistUri, [item]);
             removedCount += 1;
           } catch (singleError) {
-            console.warn(`[WARN] Failed to remove ${item.uri} (${item.uid})`, singleError);
+            console.warn(
+              `[WARN] Failed to remove ${item.uri} (${item.uid})`,
+              singleError,
+            );
           }
         }
       }
@@ -548,6 +690,11 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
     return;
   }
 
+  if (!(await ensureOwnedPlaylist(playlistUri))) {
+    Spicetify.showNotification("You can only clean playlists you own", true);
+    return;
+  }
+
   try {
     Spicetify.showNotification("Scanning playlist for duplicates…");
 
@@ -566,7 +713,12 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
     }
 
     // Collect tracks to remove (keep the best track from each group)
-    const tracksToRemove: { uri: string; uid?: string; rowId?: string; index?: number }[] = [];
+    const tracksToRemove: {
+      uri: string;
+      uid?: string;
+      rowId?: string;
+      index?: number;
+    }[] = [];
 
     for (const group of duplicateGroups) {
       // Sort by playlist position to prefer keeping earlier tracks
@@ -577,9 +729,9 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
 
       console.log(
         `[Duplicate] Keeping "${keptTrack.name}" ` +
-        `(${keptTrack.isExplicit ? "explicit" : "clean"}, ` +
-        `${keptTrack.isLocal ? "local" : "spotify"}), ` +
-        `removing ${group.tracks.length - 1} duplicate(s)`
+          `(${keptTrack.isExplicit ? "explicit" : "clean"}, ` +
+          `${keptTrack.isLocal ? "local" : "spotify"}), ` +
+          `removing ${group.tracks.length - 1} duplicate(s)`,
       );
 
       // Mark all other tracks for removal
@@ -600,7 +752,9 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
       return;
     }
 
-    Spicetify.showNotification(`Found ${tracksToRemove.length} duplicate(s), removing…`);
+    Spicetify.showNotification(
+      `Found ${tracksToRemove.length} duplicate(s), removing…`,
+    );
 
     const playlistId = getPlaylistIdFromUri(playlistUri);
     if (!playlistId) {
@@ -608,18 +762,28 @@ async function cleanPlaylist(uris: string[]): Promise<void> {
       return;
     }
 
-    const removedCount = await removeTracksFromPlaylist(playlistId, tracksToRemove);
+    const removedCount = await removeTracksFromPlaylist(
+      playlistId,
+      tracksToRemove,
+    );
     if (removedCount === 0) {
-      Spicetify.showNotification("No duplicates were removed (possibly changed playlist state)", true);
+      Spicetify.showNotification(
+        "No duplicates were removed (possibly changed playlist state)",
+        true,
+      );
       return;
     }
 
     if (removedCount < tracksToRemove.length) {
-      Spicetify.showNotification(`Removed ${removedCount}/${tracksToRemove.length} duplicate(s) from playlist`);
+      Spicetify.showNotification(
+        `Removed ${removedCount}/${tracksToRemove.length} duplicate(s) from playlist`,
+      );
       return;
     }
 
-    Spicetify.showNotification(`Removed ${removedCount} duplicate(s) from playlist!`);
+    Spicetify.showNotification(
+      `Removed ${removedCount} duplicate(s) from playlist!`,
+    );
   } catch (error) {
     console.error("[ERROR] Error cleaning playlist:", error);
     Spicetify.showNotification("Failed to clean playlist", true);
@@ -656,9 +820,9 @@ async function cleanLikedSongs(): Promise<void> {
 
       console.log(
         `[Duplicate] Keeping "${keptTrack.name}" ` +
-        `(${keptTrack.isExplicit ? "explicit" : "clean"}, ` +
-        `${keptTrack.isLocal ? "local" : "spotify"}), ` +
-        `removing ${group.tracks.length - 1} duplicate(s)`
+          `(${keptTrack.isExplicit ? "explicit" : "clean"}, ` +
+          `${keptTrack.isLocal ? "local" : "spotify"}), ` +
+          `removing ${group.tracks.length - 1} duplicate(s)`,
       );
 
       // Mark all other tracks for removal
@@ -674,11 +838,28 @@ async function cleanLikedSongs(): Promise<void> {
       return;
     }
 
-    Spicetify.showNotification(`Found ${trackUrisToRemove.length} duplicate(s), removing…`);
+    Spicetify.showNotification(
+      `Found ${trackUrisToRemove.length} duplicate(s), removing…`,
+    );
 
-    await removeTracksFromLikedSongs(trackUrisToRemove);
+    const removedCount = await removeTracksFromLikedSongs(trackUrisToRemove);
+    if (removedCount === 0) {
+      Spicetify.showNotification(
+        "No duplicates were removed from Liked Songs",
+        true,
+      );
+      return;
+    }
+    if (removedCount < trackUrisToRemove.length) {
+      Spicetify.showNotification(
+        `Removed ${removedCount}/${trackUrisToRemove.length} duplicate(s) from Liked Songs`,
+      );
+      return;
+    }
 
-    Spicetify.showNotification(`Removed ${trackUrisToRemove.length} duplicate(s) from Liked Songs!`);
+    Spicetify.showNotification(
+      `Removed ${removedCount} duplicate(s) from Liked Songs!`,
+    );
   } catch (error) {
     console.error("[ERROR] Error cleaning Liked Songs:", error);
     Spicetify.showNotification("Failed to clean Liked Songs", true);
@@ -690,12 +871,30 @@ async function cleanLikedSongs(): Promise<void> {
 function parseArtistsFromTitle(title: string): string[] {
   return title
     .split(" / ")
-    .map(name => name.trim())
-    .filter(name => name.length > 0);
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
 }
 
 async function searchArtist(artistName: string): Promise<string | null> {
   const normalizedQuery = artistName.trim().toLowerCase();
+
+  type ArtistHit = { profile?: { name?: string }; uri?: string };
+
+  const pickUri = (items: unknown[]): string | null => {
+    const candidates = items
+      .map((item) => {
+        const record = item as { data?: ArtistHit } & ArtistHit;
+        return record?.data ?? record;
+      })
+      .filter(Boolean) as ArtistHit[];
+
+    if (candidates.length === 0) return null;
+    const exact = candidates.find(
+      (artist) =>
+        artist?.profile?.name?.trim?.().toLowerCase() === normalizedQuery,
+    );
+    return exact?.uri ?? candidates[0]?.uri ?? null;
+  };
 
   // First, try searchArtists
   try {
@@ -706,22 +905,18 @@ async function searchArtist(artistName: string): Promise<string | null> {
       offset: 0,
     });
 
-    const items = response?.data?.searchV2?.artists?.items
-      ?? response?.data?.search?.artists?.items
-      ?? [];
+    const items =
+      response?.data?.searchV2?.artists?.items ??
+      response?.data?.search?.artists?.items ??
+      [];
 
-    const candidates = items
-      .map((item: any) => item?.data ?? item)
-      .filter(Boolean);
-
-    if (candidates.length > 0) {
-      const exact = candidates.find((artist: any) => artist?.profile?.name?.trim?.().toLowerCase() === normalizedQuery);
-      const uriFrom = (artist: any) => artist?.uri;
-      const foundUri = uriFrom(exact) ?? uriFrom(candidates[0]);
-      if (foundUri) return foundUri;
-    }
+    const foundUri = pickUri(items);
+    if (foundUri) return foundUri;
   } catch (error) {
-    console.warn(`[WARN] GraphQL searchArtists failed for ${artistName}:`, error);
+    console.warn(
+      `[WARN] GraphQL searchArtists failed for ${artistName}:`,
+      error,
+    );
   }
 
   // If searchArtists fails, try searchDesktop as a fallback
@@ -738,37 +933,30 @@ async function searchArtist(artistName: string): Promise<string | null> {
       includePreReleases: false,
     });
 
-    const items = response?.data?.searchV2?.artists?.items
-      ?? response?.data?.search?.artists?.items
-      ?? [];
+    const items =
+      response?.data?.searchV2?.artists?.items ??
+      response?.data?.search?.artists?.items ??
+      [];
 
-    const candidates = items
-      .map((item: any) => item?.data ?? item)
-      .filter(Boolean);
-
-    if (candidates.length > 0) {
-      const exact = candidates.find((artist: any) => artist?.profile?.name?.trim?.().toLowerCase() === normalizedQuery);
-      const uriFrom = (artist: any) => artist?.uri;
-      const foundUri = uriFrom(exact) ?? uriFrom(candidates[0]);
-      if (foundUri) return foundUri;
-    }
+    const foundUri = pickUri(items);
+    if (foundUri) return foundUri;
   } catch (error) {
-    console.warn(`[WARN] GraphQL searchDesktop failed for ${artistName}:`, error);
+    console.warn(
+      `[WARN] GraphQL searchDesktop failed for ${artistName}:`,
+      error,
+    );
   }
 
   return null;
 }
 
-
-async function getArtistDiscography(
-  artistId: string,
-): Promise<ArtistAlbum[]> {
+async function getArtistDiscography(artistId: string): Promise<ArtistAlbum[]> {
   const discog: ArtistAlbum[] = [];
   const seenAlbumIds = new Set<string>();
   let offset = 0;
   let hasNextPage = true;
-  const artistAlbumQuery = Spicetify.GraphQL.Definitions.queryArtistDiscographyAll;
-
+  const artistAlbumQuery =
+    Spicetify.GraphQL.Definitions.queryArtistDiscographyAll;
 
   while (hasNextPage) {
     try {
@@ -788,7 +976,8 @@ async function getArtistDiscography(
             discog.push({
               id: release.id,
               name: release.name,
-              date: release.date?.isoString || release.date?.year?.toString() || "",
+              date:
+                release.date?.isoString || release.date?.year?.toString() || "",
               albumType: release.type || "album",
             });
             seenAlbumIds.add(release.id);
@@ -808,60 +997,90 @@ async function getArtistDiscography(
   return discog;
 }
 
-async function getTracksFromDiscography(discography: ArtistAlbum[]): Promise<ArtistTrack[]> {
+async function getTracksFromDiscography(
+  discography: ArtistAlbum[],
+): Promise<ArtistTrack[]> {
   const tracks: ArtistTrack[] = [];
   const seenTrackIds = new Set<string>();
 
-  const getDurationMs = (track: any): number | null => {
-    const raw = track?.duration?.totalMilliseconds ?? track?.durationMs ?? track?.duration_ms;
+  type RawAlbumTrack = {
+    duration?: { totalMilliseconds?: number };
+    durationMs?: number;
+    duration_ms?: number;
+    uri?: string;
+    name?: string;
+    trackNumber?: number;
+    track_number?: number;
+  };
+
+  const getDurationMs = (track: RawAlbumTrack): number | null => {
+    const raw =
+      track?.duration?.totalMilliseconds ??
+      track?.durationMs ??
+      track?.duration_ms;
     if (typeof raw === "number" && !Number.isNaN(raw) && raw > 0) return raw;
     return null;
   };
 
-
   for (const album of discography) {
-    // Try GraphQL first if available
     const queryAlbumTracks = Spicetify.GraphQL?.Definitions?.queryAlbumTracks;
+    if (!queryAlbumTracks) continue;
 
-    if (queryAlbumTracks) {
+    let offset = 0;
+    let hasNextPage = true;
+
+    while (hasNextPage) {
       try {
-        const { data, errors } = await Spicetify.GraphQL.Request(queryAlbumTracks, {
-          uri: `spotify:album:${album.id}`,
-          offset: 0,
-          limit: 100,
-        });
+        const { data, errors } = await Spicetify.GraphQL.Request(
+          queryAlbumTracks,
+          {
+            uri: `spotify:album:${album.id}`,
+            offset,
+            limit: 50,
+          },
+        );
 
         if (errors) {
           throw new Error(errors[0]?.message || "GraphQL error");
         }
 
-        const items = data?.albumUnion?.tracksV2?.items || data?.albumUnion?.tracks?.items || [];
+        const items =
+          data?.albumUnion?.tracksV2?.items ||
+          data?.albumUnion?.tracks?.items ||
+          [];
+        if (!items.length) break;
 
         for (const item of items) {
-          const track = item.track || item;
+          const track = (item.track || item) as RawAlbumTrack;
 
-          const trackId = track.uri ? track.uri.split(':').pop() : null;
+          const trackId = track.uri ? track.uri.split(":").pop() : null;
           if (!trackId || seenTrackIds.has(trackId)) continue;
           seenTrackIds.add(trackId);
 
           const durationMs = getDurationMs(track);
           if (!durationMs) {
-            console.warn(`[WARN] Skipping track without duration: ${track.name} (${track.uri})`);
+            console.warn(
+              `[WARN] Skipping track without duration: ${track.name} (${track.uri})`,
+            );
             continue;
           }
 
           tracks.push({
             id: trackId,
-            name: track.name,
-            uri: track.uri,
+            name: track.name ?? "",
+            uri: track.uri ?? "",
             albumId: album.id,
             albumName: album.name,
             trackNumber: track.trackNumber || track.track_number || 0,
             durationMs,
           });
         }
+
+        offset += items.length;
+        hasNextPage = items.length === 50;
       } catch (error) {
         console.error(`[ERROR] GraphQL failed for album ${album.id}:`, error);
+        break;
       }
     }
   }
@@ -894,6 +1113,11 @@ async function updatePlaylist(uris: string[]): Promise<void> {
     return;
   }
 
+  if (!(await ensureOwnedPlaylist(playlistUri))) {
+    Spicetify.showNotification("You can only update playlists you own", true);
+    return;
+  }
+
   try {
     Spicetify.showNotification("Updating playlist… fetching playlist data");
 
@@ -912,16 +1136,19 @@ async function updatePlaylist(uris: string[]): Promise<void> {
       return;
     }
 
-    Spicetify.showNotification(`Found ${artistNames.length} artist(s)… searching on Spotify`);
+    Spicetify.showNotification(
+      `Found ${artistNames.length} artist(s)… searching on Spotify`,
+    );
 
-    // Search for artists
-    const artistUris: string[] = [];
-    for (const artistName of artistNames) {
-      const artistUri = await searchArtist(artistName);
-      if (artistUri) {
-        artistUris.push(artistUri);
-      } else {
-        console.warn(`[WARN] Could not find artist: ${artistName}`);
+    const artistResults = await Promise.all(
+      artistNames.map((name) => searchArtist(name)),
+    );
+    const artistUris = artistResults.filter((uri): uri is string =>
+      Boolean(uri),
+    );
+    for (let i = 0; i < artistNames.length; i++) {
+      if (!artistResults[i]) {
+        console.warn(`[WARN] Could not find artist: ${artistNames[i]}`);
       }
     }
 
@@ -930,25 +1157,28 @@ async function updatePlaylist(uris: string[]): Promise<void> {
       return;
     }
 
-    Spicetify.showNotification(`Found ${artistUris.length} artist profile(s)… loading discographies`);
+    Spicetify.showNotification(
+      `Found ${artistUris.length} artist profile(s)… loading discographies`,
+    );
 
-    // Fetch all artist tracks
-    const allArtistTracks: ArtistTrack[] = [];
-    for (let i = 0; i < artistUris.length; i++) {
-      Spicetify.showNotification(`Fetching tracks for artist ${i + 1}/${artistUris.length}…`);
-      const tracks = await getArtistTracks(artistUris[i]);
-      allArtistTracks.push(...tracks);
-    }
+    const trackBatches = await Promise.all(
+      artistUris.map((uri) => getArtistTracks(uri)),
+    );
+    const allArtistTracks = trackBatches.flat();
 
-    Spicetify.showNotification(`Fetched ${allArtistTracks.length} artist track(s)… reading playlist tracks`);
+    Spicetify.showNotification(
+      `Fetched ${allArtistTracks.length} artist track(s)… reading playlist tracks`,
+    );
 
     // Get existing tracks
     const existingTracks = await fetchPlaylistTracks(playlistUri);
 
-    Spicetify.showNotification(`Loaded ${existingTracks.length} existing playlist track(s)… comparing`);
+    Spicetify.showNotification(
+      `Loaded ${existingTracks.length} existing playlist track(s)… comparing`,
+    );
 
     // Build lookup sets for existing tracks
-    const existingTrackUris = new Set(existingTracks.map(t => t.uri));
+    const existingTrackUris = new Set(existingTracks.map((t) => t.uri));
     const existingTracksByName = new Map<string, Array<number | null>>();
 
     for (const track of existingTracks) {
@@ -971,17 +1201,21 @@ async function updatePlaylist(uris: string[]): Promise<void> {
       const duration = normalizeDuration(track.durationMs);
 
       // Skip if playlist already has an equivalent track (name + duration tolerance)
-      if (hasDurationMatch(existingTracksByName, normalizedName, duration)) continue;
+      if (hasDurationMatch(existingTracksByName, normalizedName, duration))
+        continue;
 
       // Skip if we already plan to add an equivalent track in this update
-      if (hasDurationMatch(pendingTracksByName, normalizedName, duration)) continue;
+      if (hasDurationMatch(pendingTracksByName, normalizedName, duration))
+        continue;
 
       addDurationEntry(pendingTracksByName, normalizedName, duration);
       newTrackUris.push(track.uri);
     }
 
     if (newTrackUris.length === 0) {
-      Spicetify.showNotification("No new tracks to add – playlist already up to date");
+      Spicetify.showNotification(
+        "No new tracks to add – playlist already up to date",
+      );
       return;
     }
 
@@ -991,9 +1225,16 @@ async function updatePlaylist(uris: string[]): Promise<void> {
       return;
     }
 
-    await addTracksToPlaylist(playlistId, newTrackUris);
+    Spicetify.showNotification(`Adding ${newTrackUris.length} tracks…`);
+    const added = await addTracksToPlaylist(playlistId, newTrackUris);
+    if (!added) {
+      Spicetify.showNotification("Failed to add tracks to playlist", true);
+      return;
+    }
 
-    Spicetify.showNotification(`Added ${newTrackUris.length} tracks to the playlist!`);
+    Spicetify.showNotification(
+      `Added ${newTrackUris.length} tracks to the playlist!`,
+    );
   } catch (error) {
     console.error("[ERROR] Error updating playlist:", error);
     Spicetify.showNotification("Failed to update playlist", true);
@@ -1005,32 +1246,33 @@ async function updatePlaylist(uris: string[]): Promise<void> {
 async function main(): Promise<void> {
   // Wait for Spicetify to be ready
   while (!Spicetify?.showNotification) {
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  // Warm ownership cache for synchronous context-menu visibility checks.
-  void refreshOwnedPlaylistUris();
+  // Warm ownership cache and keep it current.
+  await refreshOwnedPlaylistUris(true);
+  watchOwnedPlaylistChanges();
 
   // Register context menu items
   const cleanPlaylistItem = new Spicetify.ContextMenu.Item(
     "Clean Playlist",
     cleanPlaylist,
     shouldAddToPlaylist,
-    "playlist"
+    "playlist",
   );
 
   const updatePlaylistItem = new Spicetify.ContextMenu.Item(
     "Update Playlist",
     updatePlaylist,
     shouldAddToPlaylist,
-    "playlist"
+    "playlist",
   );
 
   const cleanLikedSongsItem = new Spicetify.ContextMenu.Item(
     "Clean Liked Songs",
     cleanLikedSongs,
     shouldAddToLikedSongs,
-    "heart-active"
+    "heart-active",
   );
 
   cleanPlaylistItem.register();

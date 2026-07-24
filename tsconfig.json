@@ -6,7 +6,6 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["@spicemod/creator/client"],
     "skipLibCheck": true,
-    "jsx": "react-jsx",
 
     /* Bundler mode */
     "moduleResolution": "bundler",
@@ -22,8 +21,6 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
 
-    // Paths
-    "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"]
     }
