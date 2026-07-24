@@ -192,6 +192,17 @@ function shouldAddToLikedSongs(
   return false;
 }
 
+function shouldAddLikeMissing(
+  uris: string[],
+  _uids?: string[],
+  contextUri?: string,
+): boolean {
+  const targetUri = contextUri ?? uris?.[0];
+  if (!targetUri) return false;
+  if (isLikedSongsUri(targetUri)) return false;
+  return Spicetify.URI.isPlaylistV1OrV2(targetUri);
+}
+
 function getPlaylistUri(uris: string[]): string | null {
   if (!uris || uris.length === 0) return null;
   return uris[0];
@@ -590,6 +601,23 @@ async function removeTracksFromLikedSongs(
   }
 
   return removedCount;
+}
+
+async function addTracksToLikedSongs(trackUris: string[]): Promise<number> {
+  let likedCount = 0;
+
+  for (let i = 0; i < trackUris.length; i += API_BATCH_SIZE) {
+    const batch = trackUris.slice(i, i + API_BATCH_SIZE);
+
+    try {
+      await Spicetify.Platform.LibraryAPI.add({ uris: batch });
+      likedCount += batch.length;
+    } catch (error) {
+      console.error("[ERROR] Failed to add tracks to Liked Songs:", error);
+    }
+  }
+
+  return likedCount;
 }
 
 async function addTracksToPlaylist(
@@ -1266,6 +1294,80 @@ async function updatePlaylist(uris: string[]): Promise<void> {
   }
 }
 
+async function likeMissingPlaylistTracks(uris: string[]): Promise<void> {
+  const playlistUri = getPlaylistUri(uris);
+  if (!playlistUri) {
+    console.error("[ERROR] No playlist URI found");
+    Spicetify.showNotification("No playlist selected", true);
+    return;
+  }
+
+  try {
+    Spicetify.showNotification("Comparing playlist to Liked Songs…");
+
+    const [playlistTracks, likedTracks] = await Promise.all([
+      fetchPlaylistTracks(playlistUri),
+      fetchAllLikedSongsTracks(),
+    ]);
+
+    if (playlistTracks.length === 0) {
+      Spicetify.showNotification("Playlist is empty", true);
+      return;
+    }
+
+    const likedUris = new Set(likedTracks.map((t) => t.uri));
+    const likedByName = new Map<string, Array<number | null>>();
+    for (const track of likedTracks) {
+      addDurationEntry(
+        likedByName,
+        normalizeTrackName(track.name),
+        normalizeDuration(track.durationMs),
+      );
+    }
+
+    const urisToLike: string[] = [];
+    const pendingByName = new Map<string, Array<number | null>>();
+
+    for (const track of playlistTracks) {
+      if (!track.uri || track.isLocal) continue;
+      if (likedUris.has(track.uri)) continue;
+
+      const normalizedName = normalizeTrackName(track.name);
+      const duration = normalizeDuration(track.durationMs);
+
+      if (shouldSkipAddingTrack(likedByName, normalizedName, duration)) continue;
+      if (shouldSkipAddingTrack(pendingByName, normalizedName, duration)) continue;
+
+      addDurationEntry(pendingByName, normalizedName, duration);
+      urisToLike.push(track.uri);
+    }
+
+    if (urisToLike.length === 0) {
+      Spicetify.showNotification("All playlist tracks are already in Liked Songs");
+      return;
+    }
+
+    Spicetify.showNotification(`Liking ${urisToLike.length} track(s)…`);
+
+    const likedCount = await addTracksToLikedSongs(urisToLike);
+    if (likedCount === 0) {
+      Spicetify.showNotification("Failed to add tracks to Liked Songs", true);
+      return;
+    }
+    if (likedCount < urisToLike.length) {
+      Spicetify.showNotification(
+        `Liked ${likedCount}/${urisToLike.length} track(s)`,
+      );
+      return;
+    }
+
+    Spicetify.showNotification(`Liked ${likedCount} track(s)!`);
+  } catch (error) {
+    console.error("[ERROR] Error liking missing tracks:", error);
+    Spicetify.showNotification("Failed to like missing tracks", true);
+  }
+}
+
 // ============== Entry Point ==============
 
 async function main(): Promise<void> {
@@ -1293,6 +1395,13 @@ async function main(): Promise<void> {
     "playlist",
   );
 
+  const likeMissingItem = new Spicetify.ContextMenu.Item(
+    "Like Missing Tracks",
+    likeMissingPlaylistTracks,
+    shouldAddLikeMissing,
+    "heart-active",
+  );
+
   const cleanLikedSongsItem = new Spicetify.ContextMenu.Item(
     "Clean Liked Songs",
     cleanLikedSongs,
@@ -1302,6 +1411,7 @@ async function main(): Promise<void> {
 
   cleanPlaylistItem.register();
   updatePlaylistItem.register();
+  likeMissingItem.register();
   cleanLikedSongsItem.register();
 }
 
