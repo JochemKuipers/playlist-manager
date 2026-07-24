@@ -503,65 +503,50 @@ async function getPlaylistData(
 }
 
 async function fetchAllLikedSongsTracks(): Promise<PlaylistTrack[]> {
-  const result: PlaylistTrack[] = [];
-
   try {
-    const res = await Spicetify.CosmosAsync.get(
-      "sp://core-collection/unstable/@/list/tracks/all?responseFormat=protobufJson",
-    );
+    // ponytail: LibraryAPI over dead CosmosAsync collection endpoints
+    const res = await Spicetify.Platform.LibraryAPI.getTracks({
+      limit: -1,
+    });
 
-    if (!res?.item) {
-      return result;
-    }
+    type RawLiked = {
+      isPlayable?: boolean;
+      uri: string;
+      name: string;
+      duration?: { milliseconds?: number };
+      durationMs?: number;
+      duration_ms?: number;
+      artists?: Array<{ name?: string }>;
+      isExplicit?: boolean;
+      is_explicit?: boolean;
+      album?: { images?: Array<{ url?: string }> };
+      uid?: string;
+    };
 
-    let trackIndex = 0;
-    for (const item of res.item) {
-      const trackMeta = item?.trackMetadata as
-        | {
-            link?: string;
-            name?: string;
-            length?: number;
-            artist?: Array<{ name?: string }>;
-            isExplicit?: boolean;
-            album?: { image?: Array<{ fileUri?: string }> };
-            playable?: boolean;
-          }
-        | undefined;
-      if (!trackMeta) {
-        trackIndex++;
-        continue;
-      }
-
-      const uri = trackMeta.link;
-      const name = trackMeta.name;
-      const durationMs = trackMeta.length ?? 0;
-      const artists = (trackMeta.artist ?? [])
-        .map((a) => a.name)
-        .filter((n): n is string => Boolean(n));
-      const isLocal = uri?.startsWith("spotify:local:") ?? false;
-      const isExplicit = trackMeta.isExplicit ?? false;
-      const albumImageUrl = trackMeta.album?.image?.[0]?.fileUri;
-      const isPlayable = trackMeta.playable ?? true;
-
-      if (uri && name && isPlayable) {
-        result.push({
-          uri,
-          name,
-          durationMs,
-          artists,
-          isLocal,
-          isExplicit,
-          albumImageUrl,
-          index: trackIndex,
-        });
-      }
-      trackIndex++;
-    }
+    const items = (res?.items ?? []) as RawLiked[];
+    return items
+      .filter((track) => track.isPlayable !== false)
+      .map((track, index) => ({
+        uri: track.uri,
+        name: track.name,
+        durationMs:
+          track.duration?.milliseconds ??
+          track.durationMs ??
+          track.duration_ms ??
+          0,
+        artists: (track.artists ?? [])
+          .map((a) => a.name)
+          .filter((n): n is string => Boolean(n)),
+        isLocal: track.uri.startsWith("spotify:local:"),
+        isExplicit: track.isExplicit ?? track.is_explicit ?? false,
+        albumImageUrl: track.album?.images?.[0]?.url,
+        uid: track.uid,
+        index,
+      }));
   } catch (error) {
     console.error("[ERROR] Failed to fetch Liked Songs:", error);
+    return [];
   }
-
-  return result;
 }
 
 async function removeTracksFromLikedSongs(
@@ -877,77 +862,58 @@ function parseArtistsFromTitle(title: string): string[] {
 
 async function searchArtist(artistName: string): Promise<string | null> {
   const normalizedQuery = artistName.trim().toLowerCase();
-
-  type ArtistHit = { profile?: { name?: string }; uri?: string };
-
-  const pickUri = (items: unknown[]): string | null => {
-    const candidates = items
-      .map((item) => {
-        const record = item as { data?: ArtistHit } & ArtistHit;
-        return record?.data ?? record;
-      })
-      .filter(Boolean) as ArtistHit[];
-
-    if (candidates.length === 0) return null;
-    const exact = candidates.find(
-      (artist) =>
-        artist?.profile?.name?.trim?.().toLowerCase() === normalizedQuery,
-    );
-    return exact?.uri ?? candidates[0]?.uri ?? null;
-  };
-
-  // First, try searchArtists
-  try {
-    const def = Spicetify.GraphQL.Definitions.searchArtists;
-    const response = await Spicetify.GraphQL.Request(def, {
-      searchTerm: artistName,
-      limit: 10,
-      offset: 0,
-    });
-
-    const items =
-      response?.data?.searchV2?.artists?.items ??
-      response?.data?.search?.artists?.items ??
-      [];
-
-    const foundUri = pickUri(items);
-    if (foundUri) return foundUri;
-  } catch (error) {
-    console.warn(
-      `[WARN] GraphQL searchArtists failed for ${artistName}:`,
-      error,
-    );
+  const def = Spicetify.GraphQL.Definitions?.assistedCurationSearch;
+  if (!def) {
+    console.warn("[WARN] assistedCurationSearch definition missing");
+    return null;
   }
 
-  // If searchArtists fails, try searchDesktop as a fallback
   try {
-    const def = Spicetify.GraphQL.Definitions.searchDesktop;
     const response = await Spicetify.GraphQL.Request(def, {
-      searchTerm: artistName,
-      offset: 0,
+      term: artistName,
       limit: 10,
-      numberOfTopResults: 5,
-      includeArtistHasConcertsField: false,
-      includeAudiobooks: false,
-      includeAuthors: false,
-      includePreReleases: false,
+      numberOfTopResults: 10,
     });
 
-    const items =
-      response?.data?.searchV2?.artists?.items ??
-      response?.data?.search?.artists?.items ??
-      [];
+    const artistUris: string[] = [];
+    const pushArtistUri = (uri: unknown) => {
+      if (
+        typeof uri === "string" &&
+        uri.startsWith("spotify:artist:") &&
+        !artistUris.includes(uri)
+      ) {
+        artistUris.push(uri);
+      }
+    };
 
-    const foundUri = pickUri(items);
-    if (foundUri) return foundUri;
+    for (const entry of response?.data?.searchV2?.topResultsV2?.itemsV2 ?? []) {
+      pushArtistUri(entry?.item?.data?.uri);
+    }
+    for (const item of response?.data?.searchV2?.artists?.items ?? []) {
+      pushArtistUri(item?.data?.uri);
+    }
+
+    if (artistUris.length === 0) return null;
+
+    // Response often has URIs only — resolve names when possible for exact title match.
+    const minimalDef = Spicetify.GraphQL.Definitions?.queryArtistMinimal;
+    if (minimalDef) {
+      for (const uri of artistUris) {
+        try {
+          const { data } = await Spicetify.GraphQL.Request(minimalDef, { uri });
+          const name = data?.artistUnion?.profile?.name?.trim?.().toLowerCase?.();
+          if (name === normalizedQuery) return uri;
+        } catch {
+          // keep trying / fall through to top hit
+        }
+      }
+    }
+
+    return artistUris[0];
   } catch (error) {
-    console.warn(
-      `[WARN] GraphQL searchDesktop failed for ${artistName}:`,
-      error,
-    );
+    console.warn(`[WARN] Artist search failed for ${artistName}:`, error);
+    return null;
   }
-
-  return null;
 }
 
 async function getArtistDiscography(artistId: string): Promise<ArtistAlbum[]> {
