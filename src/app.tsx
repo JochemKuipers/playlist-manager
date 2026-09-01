@@ -8,7 +8,7 @@ const ALBUM_FETCH_CONCURRENCY = 12; // parallel queryAlbumTracks calls
 
 const LIKED_SONGS_PLAYLIST_IDS = new Set([
   // Desktop client sometimes exposes Liked Songs as this synthetic playlist.
-  "37i9dQZF1F5p3rmiWPIYgZ",
+  "PUTLIKEDSONGSIDHERE",
 ]);
 
 const OWNERSHIP_CACHE_TTL_MS = 15_000;
